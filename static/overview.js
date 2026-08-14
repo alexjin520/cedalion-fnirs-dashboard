@@ -59,6 +59,7 @@
     select.disabled = !records.length;
     $("recording-count").textContent = records.length ? `${records.length} 份 SNIRF · 当前分析 ${selected?.analysis_id || "—"}` : "数据目录中没有可选 SNIRF";
     $("manifest-download").href = withRecording("/api/analysis-metadata-export");
+    $("report-download").href = withRecording("/api/report-pdf");
   }
 
   function showAnalysisError(error, inventory) {

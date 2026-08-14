@@ -3602,6 +3602,154 @@ def task_glm_csv_bytes(analysis: AnalysisData) -> tuple[bytes, str]:
     )
 
 
+def _report_font():
+    """Prefer a bundled system CJK fallback so Chinese report labels remain readable."""
+    from matplotlib.font_manager import FontProperties
+
+    candidates = (
+        "/usr/share/fonts/truetype/droid/DroidSansFallbackFull.ttf",
+        "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
+    )
+    for candidate in candidates:
+        if Path(candidate).is_file():
+            return FontProperties(fname=candidate)
+    return FontProperties()
+
+
+def _report_value(value: Any, digits: int = 3) -> str:
+    if value is None:
+        return "—"
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return str(value)
+    if not math.isfinite(number):
+        return "—"
+    return f"{number:.{digits}g}"
+
+
+def _report_page(title: str, font: Any):
+    import matplotlib.pyplot as plt
+
+    figure = plt.figure(figsize=(8.27, 11.69))
+    figure.text(0.08, 0.95, title, fontsize=19, fontweight="bold", fontproperties=font)
+    figure.text(
+        0.08,
+        0.925,
+        "Cedalion fNIRS 分析报告",
+        fontsize=9,
+        color="#64748b",
+        fontproperties=font,
+    )
+    return figure
+
+
+def report_pdf_bytes(analysis: AnalysisData) -> tuple[bytes, str]:
+    """Create a reproducible, single-record PDF without claiming scientific conclusions."""
+    from matplotlib.backends.backend_pdf import PdfPages
+    import matplotlib.pyplot as plt
+
+    font = _report_font()
+    summary = analysis.summary
+    analysis_info = summary["analysis"]
+    quality = analysis.quality_summary
+    task = analysis.task_summary
+    motion_summary = analysis.motion_summary
+    output = io.BytesIO()
+    with PdfPages(output) as pdf:
+        # Page 1: metadata and QC facts.
+        figure = _report_page("分析概况与数据质量", font)
+        lines = [
+            f"记录文件：{summary['filename']}",
+            f"受试者：{(summary.get('subject') or {}).get('display_name') or '未提供'}",
+            f"分析 ID：{analysis_info['id']}",
+            f"输入 SHA-256：{analysis_info['input_sha256']}",
+            f"分析时间：{analysis_info['created_at_utc']}",
+            f"Cedalion：{summary['cedalion_version']}    Python：{platform.python_version()}",
+            "",
+            f"采样率：{_report_value(summary.get('sample_rate_hz'))} Hz    记录时长：{_report_value(summary.get('duration_seconds') / 60, 4)} min",
+            f"波长：{' / '.join(str(value) for value in summary.get('wavelengths_nm', []))} nm    DPF：{_report_value(summary.get('dpf'))}",
+            f"原始通道：{summary.get('raw_channels', '—')}    分析通道：{summary.get('analyzed_channels', '—')}",
+            f"质量通过：{quality.get('passed_channels', 0)} / {quality.get('total_channels', 0)}",
+            f"质量门限：SNR ≥ {_report_value(quality.get('snr_threshold'))}；SCI ≥ {_report_value(quality.get('sci_threshold'))}；PSP 合格窗口 ≥ {_report_value(quality.get('psp_min_clean_fraction') * 100, 3)}%",
+            f"GVTD 异常候选：{motion_summary.get('flagged_samples', 0)} / {motion_summary.get('total_samples', 0)} 个采样点",
+            f"人工排除通道：{len(summary.get('manual_quality_control', {}).get('bad_channel_labels', []))} 个",
+            "",
+            "本页仅汇总分析事实，不替代研究者对实验假设和统计结论的解释。",
+        ]
+        figure.text(0.1, 0.88, "\n".join(lines), va="top", fontsize=10.5, linespacing=1.65, fontproperties=font)
+        figure.text(0.1, 0.09, "处理流程：SNIRF → 光密度 → HbO/HbR → 质量筛选 → 任务平均 / GLM", fontsize=9, color="#475569", fontproperties=font)
+        pdf.savefig(figure, bbox_inches="tight")
+        plt.close(figure)
+
+        # Page 2: representative task-locked response, when available.
+        figure = _report_page("任务响应结果", font)
+        try:
+            condition = (task.get("conditions") or [])[0]["value"]
+            _, channel, time, arrays = _task_arrays(analysis, condition, 0)
+            axis = figure.add_axes((0.12, 0.45, 0.78, 0.38))
+            axis.plot(time, arrays["HbO"], color="#d95f59", label="HbO")
+            axis.fill_between(time, arrays["HbO"] - arrays["HbO_sem"], arrays["HbO"] + arrays["HbO_sem"], color="#d95f59", alpha=0.16)
+            axis.plot(time, arrays["HbR"], color="#3978b8", label="HbR")
+            axis.fill_between(time, arrays["HbR"] - arrays["HbR_sem"], arrays["HbR"] + arrays["HbR_sem"], color="#3978b8", alpha=0.14)
+            axis.axvspan(0, float(task.get("stimulus_duration_seconds", 0)), color="#94a3b8", alpha=0.14)
+            axis.axvline(0, color="#64748b", linewidth=0.8)
+            axis.set_xlabel("相对刺激时间 (s)", fontproperties=font)
+            axis.set_ylabel("浓度变化 (µM)", fontproperties=font)
+            condition_count = next((item.get("count") for item in task.get("conditions", []) if item.get("value") == condition), "—")
+            axis.set_title(f"条件：{condition}    通道：{channel['label']}    试次数：{condition_count}", fontproperties=font)
+            axis.legend(prop=font)
+            axis.grid(alpha=0.2)
+            for label in axis.get_xticklabels() + axis.get_yticklabels():
+                label.set_fontproperties(font)
+            metrics = task_response_payload(analysis, condition, 0, 2000)["metrics"]
+            metric_lines = [
+                f"HbO 峰值：{_report_value(metrics['hbo_peak']['amplitude'])} µM，潜伏期：{_report_value(metrics['hbo_peak']['latency_seconds'])} s",
+                f"HbR 谷值：{_report_value(metrics['hbr_trough']['amplitude'])} µM，潜伏期：{_report_value(metrics['hbr_trough']['latency_seconds'])} s",
+                f"分段：刺激前 {analysis.config.epoch_before_seconds:g} s 至刺激后 {analysis.config.epoch_after_seconds:g} s；基线：刺激前 {analysis.config.epoch_before_seconds:g} s",
+            ]
+            figure.text(0.12, 0.32, "\n".join(metric_lines), fontsize=10, fontproperties=font, linespacing=1.7)
+            figure.text(0.12, 0.23, "图中阴影表示 SEM；默认代表第一个条件和第一个质量合格通道。完整通道结果请使用 CSV 导出。", fontsize=8.5, color="#475569", fontproperties=font)
+        except (IndexError, KeyError, TypeError, ValueError) as exc:
+            figure.text(0.1, 0.84, f"任务响应不可用：{exc}", fontsize=11, fontproperties=font)
+        pdf.savefig(figure, bbox_inches="tight")
+        plt.close(figure)
+
+        # Page 3: GLM and all analysis settings.
+        figure = _report_page("GLM 统计与分析参数", font)
+        glm_summary = analysis.glm_summary
+        glm_lines = [
+            f"GLM 状态：{'可用' if glm_summary.get('available') else '不可用'}",
+            f"模型：{glm_summary.get('model', {}).get('noise_model', '—')}；HRF：Gamma",
+            f"建模通道：{len(glm_summary.get('channel_labels', []))} 个；条件：{len(glm_summary.get('conditions', []))} 个",
+        ]
+        if not glm_summary.get("available"):
+            glm_lines.append(f"原因：{glm_summary.get('error', '未建立 GLM')}")
+        else:
+            significant = [row for row in analysis.glm_condition_effects if row.get("q_value") is not None and row["q_value"] < 0.05]
+            glm_lines.append(f"FDR q < 0.05 的条件效应：{len(significant)} 项")
+        figure.text(0.1, 0.87, "\n".join(glm_lines), va="top", fontsize=10.5, fontproperties=font, linespacing=1.7)
+        parameter_lines = [
+            f"滤波：{analysis.config.filter_min_hz:g}–{analysis.config.filter_max_hz:g} Hz",
+            f"TDDR：任务分析启用；CBSI：{analysis.config.cbsi_mode}",
+            f"GVTD：{analysis.config.gvtd_mode}；短距离通道：{analysis.config.short_separation_mode}",
+            f"短距离阈值：{analysis.config.short_separation_mm:g} mm；GLM 短距离回归：{analysis.config.glm_short_separation_mode}",
+            f"GLM 漂移截止：{analysis.config.glm_drift_cutoff_hz:g} Hz；HRF sigma：{analysis.config.glm_hrf_sigma_seconds:g} s",
+            f"GLM 生理回归：{analysis.config.glm_nuisance_mode}",
+            "",
+            "研究者备注：____________________________________________",
+            "________________________________________________________",
+            "________________________________________________________",
+        ]
+        figure.text(0.1, 0.56, "分析参数与备注\n" + "\n".join(parameter_lines), va="top", fontsize=10, fontproperties=font, linespacing=1.7)
+        figure.text(0.1, 0.09, "报告由当前缓存分析生成；如修改质量决定或分析设置，请重新生成报告并保留新的分析 ID。", fontsize=8.5, color="#475569", fontproperties=font)
+        pdf.savefig(figure, bbox_inches="tight")
+        plt.close(figure)
+
+    slug = re.sub(r"[^A-Za-z0-9._-]+", "-", summary["filename"]).strip("-")
+    return output.getvalue(), f"fnirs-report-{slug}-{analysis_info['id']}.pdf"
+
+
 class DashboardHandler(SimpleHTTPRequestHandler):
     data_dir: Path
     default_data_file: Path
@@ -3758,6 +3906,9 @@ class DashboardHandler(SimpleHTTPRequestHandler):
                 return self._json(analysis_config_payload(config, source))
 
             analysis = self._load_selected_analysis(data_file, recording_id)
+            if parsed.path == "/api/report-pdf":
+                body, filename = report_pdf_bytes(analysis)
+                return self._bytes(body, "application/pdf", filename)
             if parsed.path == "/api/analysis-metadata":
                 return self._json({"ok": True, **analysis_metadata_payload(analysis)})
             if parsed.path == "/api/analysis-metadata-export":

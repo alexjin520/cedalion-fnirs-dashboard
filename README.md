@@ -104,6 +104,8 @@ bash run-server.sh
 - `/task`（兼容 `/task.html`）：任务锁定平均响应，以及逐通道的条件 GLM beta、95% CI、t/p/q、条件对比和实际辅助/全局回归状态
 - `/quality`（兼容 `/quality.html`）：逐通道 SNR/SCI/PSP、GVTD 摘要、人工坏通道标记、事件标记、文件元信息、辅助/全局回归状态与分析流程
 
+总览页的“生成 PDF 报告”会为当前记录生成单条分析报告，包含元信息、质量事实、代表性任务响应图、GLM 状态、完整分析参数和研究者备注位置。报告不会自动替研究者解释实验假设；任务或 GLM 不可用时会记录明确原因。
+
 任务曲线显示 HbO/HbR 平均值与 SEM；响应峰值在刺激后 3–15 秒内提取。页面支持导出当前条件/通道的 CSV 和 PNG。任务与 GLM CSV 均包含 `analysis_id`、输入 SHA-256 和记录 ID。GLM 区域使用与上方相同的条件和通道，显示 Gamma HRF 系数、95% CI、t/p、跨建模通道的 Benjamini-Hochberg FDR q 值和可选条件对比；“导出 GLM CSV”包含所有建模通道的条件和对比结果。
 
 主要接口：
@@ -112,6 +114,7 @@ bash run-server.sh
 - `/api/recording`：记录摘要、UTF-8 `SubjectID` 显示名、任务参数和条件
 - `/api/analysis-metadata`：分析清单，含输入 SHA-256、分析 ID、分析时间、UTF-8 `SubjectID` 显示名、临时兼容副本状态、Python/Cedalion/运行时依赖版本、参数、输入校验、逐通道排除原因和 GLM 摘要
 - `/api/analysis-metadata-export`：下载同一份分析清单 JSON
+- `/api/report-pdf`：下载当前记录的 PDF 分析报告
 - `/api/probe`：探头几何校验、每通道距离及长/短间距分类
 - `/api/auxiliary`：辅助流清单、选择、时间对齐审计、实际辅助/全局回归状态和拒绝原因
 - `/api/quality`：逐通道 SNR/SCI 与筛选结果
