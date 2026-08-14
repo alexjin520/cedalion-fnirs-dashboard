@@ -1,0 +1,33 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" /><meta name="viewport" content="width=device-width, initial-scale=1" /><meta name="theme-color" content="#f5f6f4" />
+    <title>任务响应 · Cedalion fNIRS</title><link rel="icon" href="/favicon.svg" type="image/svg+xml" /><link rel="stylesheet" href="/workspace.css?v=task-cleanup-1" />
+  </head>
+  <body data-page="task">
+    <header class="appbar"><div class="appbar-inner">
+      <a class="brand" href="/" aria-label="fNIRS 分析工作台首页"><span class="brand-mark" aria-hidden="true"><svg viewBox="0 0 32 32"><path d="M6 20c3-8 5 7 8-4s5 7 8-4 3 0 4 0" /></svg></span><span><strong>fNIRS</strong><small>Analysis Workspace</small></span></a>
+      <nav class="primary-nav" aria-label="主导航"><a href="/" data-nav-page="overview">总览</a><a href="/signals.html" data-nav-page="signals">信号浏览</a><a href="/task.html" data-nav-page="task">任务响应</a><a href="/quality.html" data-nav-page="quality">质量与记录</a></nav>
+      <div class="appbar-actions"><div id="connection" class="connection waiting" role="status" aria-live="polite"><span class="status-dot"></span><span>正在连接</span></div><button id="export" class="button button-secondary" type="button" disabled><svg viewBox="0 0 24 24"><path d="M12 3v12m0 0 4-4m-4 4-4-4M5 17v3h14v-3" /></svg>导出 CSV</button><button id="refresh" class="button button-primary" type="button"><svg viewBox="0 0 24 24"><path d="M20 11a8 8 0 1 0-2.3 5.7M20 4v7h-7" /></svg>刷新</button></div>
+    </div></header>
+    <main class="shell page-shell">
+      <header class="page-heading"><div><p class="eyebrow">TASK RESPONSE</p><h1>任务响应</h1><p>TDDR 运动校正，可选 CBSI 血氧校正，并执行任务开始前基线校正；有重复区间时计算条件平均与标准误。</p></div><div class="page-context"><strong id="context-file">正在读取记录…</strong><span id="context-meta">—</span></div></header>
+      <section class="panel task-panel standalone" aria-labelledby="task-title">
+        <header class="panel-header task-header"><div><p class="eyebrow">CONDITION AVERAGE</p><h2 id="task-title">任务诱发血氧响应</h2><p id="task-subtitle" class="panel-subtitle">选择任务条件和合格通道</p></div><div class="task-actions"><button id="task-png" class="button button-secondary" type="button" disabled>保存图像 PNG</button></div></header>
+        <div class="task-toolbar"><label class="compact-field"><span>任务条件</span><select id="task-condition" disabled><option>等待分析</option></select></label><label class="compact-field"><span>合格通道</span><select id="task-channel" disabled><option>等待质量筛选</option></select></label><div id="task-method" class="method-note">首次计算需要等待</div></div>
+        <div class="task-layout"><div><div id="task-chart-wrap" class="task-chart-wrap"><canvas id="task-chart" aria-label="任务锁定 HbO 和 HbR 响应曲线"></canvas><div id="task-message" class="chart-message">正在执行任务分析…</div></div><div class="task-legend"><span><i class="hbo"></i>HbO 响应</span><span><i class="hbr"></i>HbR 响应</span><span><i class="stimulus"></i>任务区间</span></div></div><aside class="task-metrics" aria-label="任务响应指标"><div><span>纳入区间</span><strong id="task-epochs">—</strong><small id="task-epochs-detail">—</small></div><div><span>HbO 峰值</span><strong id="hbo-peak">—</strong><small id="hbo-latency">响应窗 3–15 秒</small></div><div><span>HbR 谷值</span><strong id="hbr-trough">—</strong><small id="hbr-latency">响应窗 3–15 秒</small></div><div><span>质量筛选</span><strong id="task-channels">—</strong><small id="task-excluded">—</small></div></aside></div>
+      </section>
+      <section class="panel glm-panel standalone" aria-labelledby="glm-title">
+        <header class="panel-header task-header"><div><p class="eyebrow">MODEL-BASED INFERENCE</p><h2 id="glm-title">GLM 统计推断</h2><p id="glm-subtitle" class="panel-subtitle">与上方所选条件和通道对应的 HRF 回归结果</p></div><div class="task-actions"><button id="glm-export" class="button button-secondary" type="button" disabled>导出 GLM CSV</button></div></header>
+        <div class="glm-toolbar"><label class="compact-field"><span>条件对比</span><select id="glm-contrast" disabled><option>等待 GLM</option></select></label><div id="glm-method" class="method-note">正在构建设计矩阵…</div></div>
+        <div class="glm-result-grid">
+          <section class="glm-result-section" aria-labelledby="glm-condition-title"><h3 id="glm-condition-title">条件效应</h3><div class="table-wrap"><table><thead><tr><th>成分</th><th>Beta</th><th>95% CI</th><th>t</th><th>p</th><th>q (FDR)</th><th>R²</th></tr></thead><tbody id="glm-condition-body"><tr><td colspan="7" class="empty-cell">等待 GLM 结果</td></tr></tbody></table></div></section>
+          <section class="glm-result-section" aria-labelledby="glm-contrast-title"><h3 id="glm-contrast-title">条件对比</h3><div class="table-wrap"><table><thead><tr><th>成分</th><th>效应差</th><th>95% CI</th><th>t</th><th>p</th><th>q (FDR)</th><th>R²</th></tr></thead><tbody id="glm-contrast-body"><tr><td colspan="7" class="empty-cell">选择两个以上条件后显示</td></tr></tbody></table></div></section>
+        </div>
+        <p id="glm-message" class="glm-message">GLM 使用 Gamma HRF、漂移回归量和当前质量筛选后的通道；q 值按条件/对比及血红蛋白成分跨通道进行 Benjamini-Hochberg 校正。</p>
+      </section>
+      <footer class="page-footer"><span>峰值和潜伏期在刺激后 3–15 秒响应窗内计算。</span><span id="updated-at">尚未更新</span></footer>
+    </main>
+    <script src="/common.js?v=nuisance-1" defer></script><script src="/task.js?v=nuisance-1" defer></script>
+  </body>
+</html>

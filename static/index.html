@@ -1,0 +1,92 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="theme-color" content="#f5f6f4" />
+    <title>总览 · Cedalion fNIRS</title>
+    <link rel="icon" href="/favicon.svg" type="image/svg+xml" />
+    <link rel="stylesheet" href="/workspace.css?v=records-1" />
+  </head>
+  <body data-page="overview">
+    <header class="appbar">
+      <div class="appbar-inner">
+        <a class="brand" href="/" aria-label="fNIRS 分析工作台首页">
+          <span class="brand-mark" aria-hidden="true"><svg viewBox="0 0 32 32"><path d="M6 20c3-8 5 7 8-4s5 7 8-4 3 0 4 0" /></svg></span>
+          <span><strong>fNIRS</strong><small>研究分析工作台</small></span>
+        </a>
+        <nav class="primary-nav" aria-label="主导航">
+          <a href="/" data-nav-page="overview">总览</a>
+          <a href="/signals.html" data-nav-page="signals">信号浏览</a>
+          <a href="/task.html" data-nav-page="task">任务响应</a>
+          <a href="/quality.html" data-nav-page="quality">质量与记录</a>
+        </nav>
+        <div class="appbar-actions">
+          <div id="connection" class="connection waiting" role="status" aria-live="polite"><span class="status-dot"></span><span>正在连接</span></div>
+          <button id="refresh" class="button button-primary" type="button"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M20 11a8 8 0 1 0-2.3 5.7M20 4v7h-7" /></svg>重新分析</button>
+        </div>
+      </div>
+    </header>
+
+    <main class="shell">
+      <section class="recording-card overview-hero" aria-labelledby="filename">
+        <div class="recording-main">
+          <p class="eyebrow">当前记录</p>
+          <div class="recording-title-row">
+            <h1 id="filename">正在读取 SNIRF…</h1>
+            <span id="engine-badge" class="badge badge-neutral">Cedalion</span>
+          </div>
+          <p id="dataset-detail" class="recording-detail">正在建立记录摘要与质量结果</p>
+        </div>
+        <div class="recording-side">
+          <label class="recording-picker">
+            <span class="label">分析记录</span>
+            <select id="recording-select" disabled><option>正在读取记录列表</option></select>
+            <small id="recording-count">等待数据目录</small>
+          </label>
+          <a id="manifest-download" class="button button-secondary manifest-download" href="/api/analysis-metadata-export" data-recording-link>下载分析清单</a>
+          <div class="recording-events"><span class="label">刺激类型</span><div id="event-chips" class="event-chips"><span class="badge badge-neutral">等待数据</span></div></div>
+        </div>
+      </section>
+
+      <section class="overview-grid" aria-label="记录摘要">
+        <article id="quality-card" class="stat-card stat-card-primary loading">
+          <div class="stat-card-head"><span>通道质量</span><span id="quality-card-status" class="badge badge-neutral">分析中</span></div>
+          <strong id="quality-pass">—</strong>
+          <p id="quality-card-detail">等待 SNR / SCI 结果</p>
+          <div class="progress" aria-hidden="true"><i id="quality-progress"></i></div>
+        </article>
+        <article class="stat-card loading"><span>采样率</span><strong id="sample-rate">—</strong><p><span id="samples">—</span> 个采样点</p></article>
+        <article class="stat-card loading"><span>记录时长</span><strong id="duration">—</strong><p id="channel-detail"><span id="channels">—</span> 个分析通道</p></article>
+        <article class="stat-card loading"><span>事件标记</span><strong id="events">—</strong><p id="wavelengths">正在识别任务区间</p></article>
+      </section>
+
+      <section class="overview-layout" aria-label="记录状态">
+        <article class="panel health-panel">
+          <header class="panel-header">
+            <div><p class="eyebrow">DATA READINESS</p><h2>这份记录可以继续分析吗？</h2></div>
+            <span id="readiness-badge" class="badge badge-neutral">计算中</span>
+          </header>
+          <div class="readiness-score">
+            <div id="quality-ring" class="quality-ring"><strong id="quality-percent">—</strong><span>通道通过率</span></div>
+            <div class="readiness-copy">
+              <strong id="readiness-title">正在检查信号质量</strong>
+              <p id="readiness-detail">将综合通道质量与任务条件给出下一步建议。</p>
+              <a id="readiness-link" class="text-link" href="/quality.html" data-recording-link>查看质量详情 <span>→</span></a>
+            </div>
+          </div>
+          <dl class="health-facts">
+            <div><dt>需关注通道</dt><dd id="attention-count">—</dd></div>
+            <div><dt>可用任务条件</dt><dd id="condition-count">—</dd></div>
+            <div><dt>运动校正</dt><dd id="motion-method">—</dd></div>
+          </dl>
+        </article>
+
+      </section>
+
+      <footer class="page-footer"><span>数据仅在服务器分析，浏览器接收降采样结果。</span><span id="updated-at">尚未更新</span></footer>
+    </main>
+    <script src="/common.js?v=records-2" defer></script>
+    <script src="/overview.js?v=records-4" defer></script>
+  </body>
+</html>

@@ -1,0 +1,13 @@
+.venv/
+.runtime/
+.bootstrap/
+.cedalion-env/
+.miniconda/
+.conda-env/
+.vendor/
+data/cedalion-cache/
+# Local SNIRF recordings and derived analysis data are intentionally not versioned.
+data/
+__pycache__/
+*.pyc
+*.log

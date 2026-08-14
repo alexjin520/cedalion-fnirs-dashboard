@@ -1,0 +1,60 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="theme-color" content="#f5f6f4" />
+    <title>信号浏览 · Cedalion fNIRS</title>
+    <link rel="icon" href="/favicon.svg" type="image/svg+xml" />
+    <link rel="stylesheet" href="/workspace.css?v=records-1" />
+  </head>
+  <body data-page="signals">
+    <header class="appbar">
+      <div class="appbar-inner">
+        <a class="brand" href="/" aria-label="fNIRS 分析工作台首页"><span class="brand-mark" aria-hidden="true"><svg viewBox="0 0 32 32"><path d="M6 20c3-8 5 7 8-4s5 7 8-4 3 0 4 0" /></svg></span><span><strong>fNIRS</strong><small>Analysis Workspace</small></span></a>
+        <nav class="primary-nav" aria-label="主导航"><a href="/" data-nav-page="overview">总览</a><a href="/signals.html" data-nav-page="signals">信号浏览</a><a href="/task.html" data-nav-page="task">任务响应</a><a href="/quality.html" data-nav-page="quality">质量与记录</a></nav>
+        <div class="appbar-actions"><div id="connection" class="connection waiting" role="status" aria-live="polite"><span class="status-dot"></span><span>正在连接</span></div><button id="refresh" class="button button-primary" type="button"><svg viewBox="0 0 24 24"><path d="M20 11a8 8 0 1 0-2.3 5.7M20 4v7h-7" /></svg>刷新</button></div>
+      </div>
+    </header>
+
+    <main class="shell page-shell">
+      <header class="page-heading">
+        <div><p class="eyebrow">SIGNAL EXPLORER</p><h1>信号浏览</h1><p>逐通道比较原始光强、光密度和血氧浓度，拖动曲线即可放大时间区间。</p></div>
+        <div class="page-context"><strong id="context-file">正在读取记录…</strong><span id="context-meta">—</span></div>
+      </header>
+
+      <section class="workspace" aria-label="信号分析工作区">
+        <article class="panel chart-panel">
+          <header class="panel-header chart-heading">
+            <div><p class="eyebrow">TIME SERIES</p><h2 id="chart-title">滤波后 HbO / HbR</h2><p id="chart-subtitle" class="panel-subtitle">选择分析类型和通道查看信号</p></div>
+            <div id="chart-legend" class="chart-legend" aria-label="图例"></div>
+          </header>
+          <div class="chart-toolbar">
+            <div id="series-tabs" class="segmented" role="group" aria-label="分析类型"><button type="button" data-kind="amp">原始</button><button type="button" data-kind="od">OD</button><button type="button" data-kind="conc">HbO/HbR</button><button type="button" data-kind="conc_filtered" class="active">滤波后</button></div>
+            <label class="compact-field"><span>信号校正</span><select id="motion-select"><option value="conc_filtered">未校正</option><option value="conc_tddr_filtered" selected>TDDR</option><option value="conc_tddr_cbsi_filtered">TDDR + CBSI</option><option value="conc_wavelet_filtered">Wavelet（实验）</option></select></label>
+            <label class="compact-field"><span>波长 / 成分</span><select id="component-select" disabled><option>等待分析</option></select></label>
+            <button id="reset-zoom" class="icon-button" type="button" title="重置图表缩放" disabled><svg viewBox="0 0 24 24"><path d="M4 4v6h6M20 20v-6h-6M5.5 15a7 7 0 0 0 11.8 2.3L20 14M4 10l2.7-3.3A7 7 0 0 1 18.5 9" /></svg><span>重置</span></button>
+          </div>
+          <div id="chart-wrap" class="chart-wrap"><canvas id="signal-chart" tabindex="0" aria-label="fNIRS 信号曲线，可拖动选择时间范围"></canvas><div id="chart-tooltip" class="chart-tooltip" hidden></div><div id="chart-message" class="chart-message">服务器正在执行 Cedalion 分析…</div></div>
+          <footer class="chart-footer"><span>拖动图表缩放时间范围，双击恢复全部</span><span id="downsample-note">—</span></footer>
+        </article>
+
+        <aside class="panel inspector" aria-labelledby="inspector-title">
+          <header class="panel-header inspector-header"><div><p class="eyebrow">CHANNEL INSPECTOR</p><h2 id="inspector-title">通道检查器</h2></div><span id="channel-status" class="badge badge-neutral">等待分析</span></header>
+          <label class="field"><span>当前通道</span><select id="channel-select" disabled><option>等待分析</option></select></label>
+          <div class="optode-map" aria-label="光源探测器关系"><div><span>光源</span><strong id="source-name">—</strong></div><i><span></span></i><div><span>探测器</span><strong id="detector-name">—</strong></div></div>
+          <section class="quality-readings" aria-label="当前通道质量">
+            <div class="reading"><div><span>平均 / 最低 SNR</span><strong id="channel-snr">—</strong></div><div class="meter"><i id="snr-meter"></i></div><small>阈值：最低 SNR ≥ 2</small></div>
+            <div class="reading"><div><span>平均 SCI</span><strong id="channel-sci">—</strong></div><div class="meter"><i id="sci-meter"></i></div><small>阈值：SCI ≥ 0.7</small></div>
+            <div class="reading"><div><span>PSP 中位数</span><strong id="channel-psp">—</strong></div><small id="channel-psp-note">5秒窗口质量指标，参与自动通道淘汰</small></div>
+          </section>
+          <section class="signal-stats" aria-label="信号统计"><div class="section-label"><span>当前信号统计</span><small id="stats-component">—</small></div><dl><div><dt>最小值</dt><dd id="stat-min">—</dd></div><div><dt>最大值</dt><dd id="stat-max">—</dd></div><div><dt>平均值</dt><dd id="stat-mean">—</dd></div><div><dt>标准差</dt><dd id="stat-std">—</dd></div></dl></section>
+        </aside>
+      </section>
+
+      <section class="page-tip"><span class="status-dot"></span><p><strong>任务与运动候选区段已标在曲线上。</strong> 橙色表示任务区间，红色表示 GVTD 自动标出的异常候选；CBSI 基于 HbO/HbR 负相关假设，Wavelet 是实验比较选项。</p><a href="/task.html">转到任务响应 →</a></section>
+      <footer class="page-footer"><span>显示数据会按视图宽度降采样，统计值基于完整数据。</span><span id="updated-at">尚未更新</span></footer>
+    </main>
+    <script src="/common.js?v=records-1" defer></script><script src="/signals.js?v=canvas-light-1" defer></script>
+  </body>
+</html>

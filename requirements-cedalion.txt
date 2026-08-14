@@ -1,0 +1,25 @@
+# Runtime subset required by the dashboard's Cedalion CW-fNIRS pipeline.
+# Cedalion itself is installed from the official repository with --no-deps.
+click==8.2.*
+h5py==3.14.*
+joblib==1.5.*
+matplotlib==3.10.*
+mne==1.9.*
+nibabel==5.3.*
+numpy==2.2.*
+pandas==2.3.*
+pint-xarray==0.4.*
+pooch==1.8.*
+pybtex>=0.26,<0.27
+pyvista==0.45.*
+pywavelets==1.8.*
+scikit-image==0.25.*
+scikit-learn==1.7.*
+scipy==1.15.*
+snirf==0.8.*
+statsmodels==0.14.4
+strenum==0.4.*
+trimesh==4.6.*
+vtk>=9.4,<9.5
+xarray==2025.6.*
+

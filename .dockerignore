@@ -1,0 +1,10 @@
+*
+!Dockerfile
+!requirements-cedalion.txt
+!server.py
+!static/
+!static/**
+!data/
+!data/samples/
+!data/samples/fingertapping.snirf
+

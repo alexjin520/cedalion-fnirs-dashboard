@@ -1,0 +1,4 @@
+interface:
+  display_name: "Cedalion fNIRS Dashboard"
+  short_description: "Keep Cedalion server work simple and research-ready"
+  default_prompt: "Use $cedalion-fnirs-dashboard to improve this Cedalion fNIRS server with small, readable, research-ready changes."
