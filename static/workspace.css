@@ -167,6 +167,12 @@ h2 { margin-bottom: 0; font-size: 19px; line-height: 1.25; letter-spacing: -.02e
 .recording-picker { display: flex; width: min(320px, 100%); flex-direction: column; gap: 5px; }
 .recording-picker select { min-width: 0; }
 .recording-picker small { color: var(--muted); font-size: 10px; line-height: 1.35; }
+.recording-file-actions { display: flex; width: min(320px, 100%); align-items: center; justify-content: flex-end; gap: 7px; }
+.recording-file-actions .button { flex: 1 1 auto; }
+.recording-file-actions .icon-button.danger:hover { color: var(--danger); border-color: rgba(255, 107, 107, .45); background: rgba(255, 107, 107, .08); }
+.recording-action-status { width: min(320px, 100%); min-height: 14px; color: var(--muted); text-align: right; font-size: 10px; line-height: 1.35; }
+.recording-action-status.error { color: var(--danger); }
+.recording-action-status.success { color: var(--success); }
 .recording-events { display: flex; width: min(320px, 100%); flex-direction: column; align-items: flex-end; gap: 6px; }
 .manifest-download { min-width: 150px; }
 
@@ -263,6 +269,9 @@ select:disabled { cursor: not-allowed; color: var(--muted); }
 .optode-map > i::before, .optode-map > i::after { position: absolute; top: -3px; width: 7px; height: 7px; border-radius: 50%; content: ""; background: var(--accent); }
 .optode-map > i::before { left: 0; }
 .optode-map > i::after { right: 0; background: var(--blue); }
+.channel-distance { display: flex; align-items: baseline; justify-content: space-between; gap: 12px; margin: 16px 0 18px; padding: 10px 0; border-top: 1px solid var(--border-soft); border-bottom: 1px solid var(--border-soft); }
+.channel-distance span { color: var(--text-secondary); font-size: 11px; }
+.channel-distance strong { font: 700 13px/1.3 ui-monospace, monospace; }
 
 .quality-readings { display: grid; gap: 17px; padding: 17px 0; border-top: 1px solid var(--border-soft); border-bottom: 1px solid var(--border-soft); }
 .reading > div:first-child { display: flex; justify-content: space-between; align-items: baseline; gap: 12px; }
@@ -472,6 +481,7 @@ tbody tr.selected { background: var(--accent-soft); }
   .brand small { display: none; }
   .recording-card { grid-template-columns: 1fr; gap: 15px; }
   .recording-side { align-items: flex-start; }
+  .recording-file-actions, .recording-action-status { justify-content: flex-start; text-align: left; }
   .recording-events { align-items: flex-start; }
   .event-chips { justify-content: flex-start; }
   .chart-heading { flex-direction: column; gap: 8px; }

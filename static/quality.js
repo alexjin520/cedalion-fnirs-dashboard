@@ -53,6 +53,7 @@
     const auxiliary = nuisance.auxiliary || {};
     const global = nuisance.global || {};
     const cbsi = nuisance.cbsi || {};
+    const resampling = summary.resampling || validation.resampling || {};
     const subject = summary.subject || {};
     const compatibility = validation.compatibility || {};
     const warningText = validation.warnings?.length ? `需注意：${validation.warnings.join("；")}` : "通过";
@@ -66,6 +67,10 @@
       ["记录时长", `${number.format(summary.duration_seconds)} s`], ["通道 / 测量", `${summary.channels} / ${summary.measurements}`],
       ["原始 / 分析通道", `${summary.raw_channels} / ${summary.analyzed_channels}`],
       ["光强预处理", `排除 ${summary.excluded_nonpositive_channels} 个无效通道，插值 ${summary.interpolated_samples} 个采样点`],
+      ["采样与重采样", resampling.applied
+        ? `已重采样 ${formatValue(resampling.source_sample_rate_hz, 4)} → ${formatValue(resampling.target_sample_rate_hz, 4)} Hz · ${resampling.interpolated_samples ?? 0} 个时间点插值 · 最大缺口 ${formatValue(resampling.maximum_gap_seconds, 4)} s`
+        : `未重采样 · 原始 ${formatValue(resampling.source_sample_rate_hz ?? summary.sample_rate_hz, 4)} Hz · 模式 ${resampling.mode || "auto"}`],
+      ["抗混叠 / 事件时间", `${resampling.anti_aliasing?.applied ? `低通 ${formatValue(resampling.anti_aliasing.cutoff_hz, 4)} Hz` : "未执行抗混叠"} · ${resampling.event_timing?.preserved === false ? "事件时间异常" : "onset/duration 保持秒语义"}`],
       ["事件 / 任务区间", `${summary.stimulus_events} / ${summary.task_intervals}`],
       ["波长", `${summary.wavelengths_nm.join(" / ")} nm`], ["Cedalion", summary.cedalion_version],
       ["分析参数", `DPF ${formatValue(parameters.dpf, 3)} · ${parameters.filter_hz?.join("–") || "—"} Hz · SNR ${formatValue(parameters.snr_threshold, 3)}`],
@@ -132,9 +137,38 @@
     }
   }
 
+  function ensureResamplingControls(form) {
+    if (form.querySelector("[data-resampling-settings]")) return;
+    const fieldset = document.createElement("fieldset");
+    fieldset.dataset.resamplingSettings = "true";
+    const legend = document.createElement("legend"); legend.textContent = "采样与重采样";
+    const modeLabel = document.createElement("label");
+    const modeTitle = document.createElement("span"); modeTitle.textContent = "重采样模式";
+    const mode = document.createElement("select"); mode.name = "resampling_mode";
+    mode.append(optionElement("auto", "自动（不规则时处理）"), optionElement("off", "关闭（不规则即拒绝）"), optionElement("force", "强制重建时间轴"));
+    modeLabel.append(modeTitle, mode);
+    const targetLabel = document.createElement("label");
+    const targetTitle = document.createElement("span"); targetTitle.textContent = "目标采样率 (Hz)";
+    const target = document.createElement("input"); target.name = "resampling_target_rate_hz"; target.type = "number"; target.min = "0"; target.step = "0.01"; target.required = true;
+    targetLabel.append(targetTitle, target);
+    const gapLabel = document.createElement("label");
+    const gapTitle = document.createElement("span"); gapTitle.textContent = "最大插值缺口 (s)";
+    const gap = document.createElement("input"); gap.name = "resampling_max_gap_seconds"; gap.type = "number"; gap.min = "0.001"; gap.step = "0.01"; gap.required = true;
+    gapLabel.append(gapTitle, gap);
+    fieldset.append(legend, modeLabel, targetLabel, gapLabel);
+    const actions = form.querySelector(".settings-actions");
+    if (actions) form.insertBefore(fieldset, actions); else form.append(fieldset);
+  }
+
   function populateSettings(payload) {
     const form = $("analysis-settings");
+    const dpf = form.elements.namedItem("dpf");
+    if (dpf) {
+      dpf.min = "0.01";
+      dpf.step = "0.01";
+    }
     ensureCbsiControl(form);
+    ensureResamplingControls(form);
     const settings = payload.settings;
     Object.entries(settings).forEach(([name, value]) => {
       if (name !== "glm") setFormValue(form, name, value);
@@ -155,6 +189,9 @@
       gvtd_mode: form.elements.namedItem("gvtd_mode").value,
       psp_threshold: numberValue("psp_threshold"), psp_min_clean_fraction: numberValue("psp_min_clean_fraction"),
       cbsi_mode: form.elements.namedItem("cbsi_mode").value,
+      resampling_mode: form.elements.namedItem("resampling_mode").value,
+      resampling_target_rate_hz: numberValue("resampling_target_rate_hz"),
+      resampling_max_gap_seconds: numberValue("resampling_max_gap_seconds"),
       glm: {
         noise_model: form.elements.namedItem("glm_noise_model").value, drift_cutoff_hz: numberValue("glm_drift_cutoff_hz"),
         hrf_sigma_seconds: numberValue("glm_hrf_sigma_seconds"), short_separation_mode: form.elements.namedItem("glm_short_separation_mode").value,

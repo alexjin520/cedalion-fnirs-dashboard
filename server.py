@@ -16,7 +16,7 @@ import re
 import shutil
 import tempfile
 from collections import Counter, defaultdict
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
 from functools import lru_cache
 from http import HTTPStatus
@@ -25,7 +25,7 @@ from itertools import combinations
 from pathlib import Path
 from threading import RLock
 from typing import Any
-from urllib.parse import parse_qs, urlparse
+from urllib.parse import parse_qs, unquote, urlparse
 
 os.environ.setdefault("MPLBACKEND", "Agg")
 
@@ -44,11 +44,13 @@ from cedalion.sigproc.frequency import freq_filter
 
 BASE_DIR = Path(__file__).resolve().parent
 STATIC_DIR = BASE_DIR / "static"
-DEFAULT_DATA_DIR = BASE_DIR / "data" / "samples"
-DEFAULT_FILENAME = "recording_20260419_173115.snirf"
-DASHBOARD_VERSION = "2026.08.13"
-ANALYSIS_MANIFEST_VERSION = "1.2"
-ANALYSIS_PROTOCOL_VERSION = "snirf-od-hb-cbsi-psp-qc-task-glm-gvtd-censor-v6"
+DEFAULT_DATA_DIR = BASE_DIR / "data"
+DEFAULT_FILENAME = "samples/recording_20260419_173115.snirf"
+DEFAULT_UPLOAD_DIRECTORY = "username"
+DEFAULT_MAX_UPLOAD_BYTES = 1024 * 1024 * 1024
+DASHBOARD_VERSION = "2026.08.17"
+ANALYSIS_MANIFEST_VERSION = "1.4"
+ANALYSIS_PROTOCOL_VERSION = "snirf-od-hb-cbsi-psp-qc-task-glm-gvtd-censor-resample-v8"
 RECORDING_QUERY_PARAMETER = "recording"
 SNIRF_SUFFIX = ".snirf"
 HASH_CHUNK_BYTES = 1024 * 1024
@@ -96,8 +98,13 @@ GLM_SHORT_SEPARATION_MODES = ("off", "auto")
 GLM_NUISANCE_MODES = ("off", "auxiliary", "global", "auxiliary_global")
 GVTD_MODES = ("report", "exclude_epochs")
 CBSI_MODES = ("off", "on")
+RESAMPLING_MODES = ("off", "auto", "force")
 ANALYSIS_LOAD_LOCK = RLock()
 ANALYSIS_CONFIG_LOCK = RLock()
+
+
+class UploadTooLargeError(ValueError):
+    """Raised when a request exceeds the configured upload limit."""
 
 
 def _environment_float(name: str, default: float) -> float:
@@ -190,6 +197,13 @@ class AnalysisConfig:
     glm_auxiliary_max_gap_seconds: float = 1.0
     gvtd_mode: str = "report"
     cbsi_mode: str = "off"
+    # ``auto`` regularises irregular input; ``off`` retains the strict legacy
+    # rejection; ``force`` rebuilds the time grid even when input is uniform.
+    resampling_mode: str = "auto"
+    # Zero means use the source median rate.  A positive value is an explicit
+    # target rate in Hz.
+    resampling_target_rate_hz: float = 0.0
+    resampling_max_gap_seconds: float = 1.0
 
     @classmethod
     def from_environment(cls) -> "AnalysisConfig":
@@ -286,14 +300,25 @@ class AnalysisConfig:
             cbsi_mode=_environment_choice(
                 "FNIRS_CBSI_MODE", cls.cbsi_mode, CBSI_MODES
             ),
+            resampling_mode=_environment_choice(
+                "FNIRS_RESAMPLING_MODE", cls.resampling_mode, RESAMPLING_MODES
+            ),
+            resampling_target_rate_hz=_environment_float(
+                "FNIRS_RESAMPLING_TARGET_RATE_HZ",
+                cls.resampling_target_rate_hz,
+            ),
+            resampling_max_gap_seconds=_environment_float(
+                "FNIRS_RESAMPLING_MAX_GAP_SECONDS",
+                cls.resampling_max_gap_seconds,
+            ),
         )
         config.validate()
         return config
 
     def validate(self) -> None:
         errors: list[str] = []
-        if self.dpf <= 0:
-            errors.append("FNIRS_DPF 必须大于 0")
+        if self.dpf < 0.01:
+            errors.append("FNIRS_DPF 必须不小于 0.01")
         if self.filter_min_hz < 0 or self.filter_max_hz <= self.filter_min_hz:
             errors.append("滤波范围必须满足 0 <= 下限 < 上限")
         if self.snr_threshold < 0:
@@ -306,8 +331,8 @@ class AnalysisConfig:
             errors.append("FNIRS_PSP_THRESHOLD 不能小于 0")
         if not 0 <= self.psp_min_clean_fraction <= 1:
             errors.append("FNIRS_PSP_MIN_CLEAN_FRACTION 必须在 0 到 1 之间")
-        if self.epoch_before_seconds < 0 or self.epoch_after_seconds <= 0:
-            errors.append("任务分段窗口无效")
+        if self.epoch_before_seconds <= 0 or self.epoch_after_seconds <= 0:
+            errors.append("任务分段窗口无效：刺激前和刺激后窗口都必须大于 0")
         if (
             self.response_start_seconds < 0
             or self.response_end_seconds <= self.response_start_seconds
@@ -359,6 +384,28 @@ class AnalysisConfig:
             errors.append("FNIRS_GVTD_MODE 必须是 " + "、".join(GVTD_MODES) + " 之一")
         if self.cbsi_mode not in CBSI_MODES:
             errors.append("FNIRS_CBSI_MODE 必须是 " + "、".join(CBSI_MODES) + " 之一")
+        if self.resampling_mode not in RESAMPLING_MODES:
+            errors.append(
+                "FNIRS_RESAMPLING_MODE 必须是 "
+                + "、".join(RESAMPLING_MODES)
+                + " 之一"
+            )
+        if not math.isfinite(self.resampling_target_rate_hz):
+            errors.append("FNIRS_RESAMPLING_TARGET_RATE_HZ 必须是有限数字")
+        elif self.resampling_target_rate_hz < 0:
+            errors.append("FNIRS_RESAMPLING_TARGET_RATE_HZ 不能小于 0")
+        if (
+            self.resampling_target_rate_hz > 0
+            and self.resampling_target_rate_hz <= 2 * self.filter_max_hz
+        ):
+            errors.append(
+                "FNIRS_RESAMPLING_TARGET_RATE_HZ 必须高于滤波上限的两倍，"
+                "以保留有效 Nyquist 频率"
+            )
+        if not math.isfinite(self.resampling_max_gap_seconds):
+            errors.append("FNIRS_RESAMPLING_MAX_GAP_SECONDS 必须是有限数字")
+        elif self.resampling_max_gap_seconds <= 0:
+            errors.append("FNIRS_RESAMPLING_MAX_GAP_SECONDS 必须大于 0")
         if errors:
             raise ValueError("；".join(errors))
 
@@ -417,6 +464,17 @@ class AnalysisConfig:
                 ),
                 "method": "Cui et al. correlation-based signal improvement",
             },
+            "resampling": {
+                "mode": self.resampling_mode,
+                "target_rate_hz": (
+                    self.resampling_target_rate_hz
+                    if self.resampling_target_rate_hz > 0
+                    else None
+                ),
+                "max_interpolation_gap_seconds": self.resampling_max_gap_seconds,
+                "time_axis": "seconds",
+                "event_time_policy": "preserve_onset_duration_seconds",
+            },
         }
 
 
@@ -444,6 +502,17 @@ def _json_choice(
     if not isinstance(value, str) or value not in choices:
         raise ValueError(f"{name} 必须是 " + "、".join(choices) + " 之一")
     return value
+
+
+def _json_optional_number(
+    payload: dict[str, Any],
+    name: str,
+    default: float,
+) -> float:
+    """Read a setting added after older persisted UI payloads existed."""
+    if name not in payload or payload[name] is None:
+        return default
+    return _json_number(payload, name)
 
 
 def analysis_config_from_payload(
@@ -485,6 +554,21 @@ def analysis_config_from_payload(
             if "cbsi_mode" in payload
             else base.cbsi_mode
         ),
+        resampling_mode=(
+            _json_choice(payload, "resampling_mode", RESAMPLING_MODES)
+            if "resampling_mode" in payload
+            else base.resampling_mode
+        ),
+        resampling_target_rate_hz=_json_optional_number(
+            payload,
+            "resampling_target_rate_hz",
+            base.resampling_target_rate_hz,
+        ),
+        resampling_max_gap_seconds=_json_optional_number(
+            payload,
+            "resampling_max_gap_seconds",
+            base.resampling_max_gap_seconds,
+        ),
         glm_noise_model=_json_choice(glm, "noise_model", GLM_NOISE_MODELS),
         glm_drift_cutoff_hz=_json_number(glm, "drift_cutoff_hz"),
         glm_hrf_sigma_seconds=_json_number(glm, "hrf_sigma_seconds"),
@@ -523,6 +607,9 @@ def analysis_config_payload(config: AnalysisConfig, source: str) -> dict[str, An
             "short_separation_mode": config.short_separation_mode,
             "gvtd_mode": config.gvtd_mode,
             "cbsi_mode": config.cbsi_mode,
+            "resampling_mode": config.resampling_mode,
+            "resampling_target_rate_hz": config.resampling_target_rate_hz,
+            "resampling_max_gap_seconds": config.resampling_max_gap_seconds,
             "glm": {
                 "noise_model": config.glm_noise_model,
                 "drift_cutoff_hz": config.glm_drift_cutoff_hz,
@@ -577,6 +664,29 @@ def _recording_id(path: Path, data_dir: Path) -> str:
         raise ValueError("记录文件必须位于 FNIRS_DATA_DIR 内") from exc
 
 
+def _is_within_directory(path: Path, directory: Path) -> bool:
+    try:
+        path.resolve().relative_to(directory.resolve())
+    except ValueError:
+        return False
+    return True
+
+
+def _upload_filename(value: str | None) -> str:
+    if value is None:
+        raise ValueError("缺少 X-FNIRS-Filename 上传文件名")
+    filename = unquote(value)
+    if not filename or "\x00" in filename:
+        raise ValueError("上传文件名不能为空")
+    if filename != Path(filename).name or filename in {".", ".."}:
+        raise ValueError("上传文件名不能包含目录")
+    if len(filename.encode("utf-8")) > 240:
+        raise ValueError("上传文件名过长")
+    if Path(filename).suffix.lower() != SNIRF_SUFFIX:
+        raise ValueError("仅支持上传 .snirf 文件")
+    return filename
+
+
 def _recording_entities(recording_id: str) -> dict[str, str | None]:
     def entity_value(name: str) -> str | None:
         match = re.search(rf"(?:^|[/_]){name}-([^/_]+)", recording_id)
@@ -592,6 +702,7 @@ def _recording_descriptor(
     path: Path,
     data_dir: Path,
     default_path: Path,
+    upload_dir: Path | None = None,
 ) -> dict[str, Any]:
     stat = path.stat()
     recording_id = _recording_id(path, data_dir)
@@ -605,24 +716,40 @@ def _recording_descriptor(
         "subject": entities["subject"],
         "session": entities["session"],
         "is_default": path.resolve() == default_path.resolve(),
+        "is_uploaded": bool(upload_dir and _is_within_directory(path, upload_dir)),
     }
 
 
 def list_recordings(
     data_dir: Path,
     default_path: Path,
+    upload_dir: Path | None = None,
     subject: str | None = None,
     session: str | None = None,
 ) -> list[dict[str, Any]]:
-    """List only resolvable SNIRF files contained by the configured data root."""
+    """List built-in and uploaded SNIRF files without exposing cache directories."""
     if not data_dir.is_dir():
         return []
     recordings: list[dict[str, Any]] = []
-    for candidate in data_dir.rglob("*"):
+    candidates: set[Path] = {
+        candidate for candidate in data_dir.glob("*") if candidate.is_file()
+    }
+    samples_dir = data_dir / "samples"
+    search_roots = [samples_dir] if samples_dir.is_dir() else [data_dir]
+    if upload_dir is not None and upload_dir.is_dir():
+        search_roots.append(upload_dir)
+    for search_root in search_roots:
+        candidates.update(candidate for candidate in search_root.rglob("*") if candidate.is_file())
+    for candidate in candidates:
         if candidate.suffix.lower() != SNIRF_SUFFIX or not candidate.is_file():
             continue
         try:
-            descriptor = _recording_descriptor(candidate.resolve(), data_dir, default_path)
+            descriptor = _recording_descriptor(
+                candidate.resolve(),
+                data_dir,
+                default_path,
+                upload_dir,
+            )
         except (OSError, ValueError):
             continue
         if subject and descriptor["subject"] != subject:
@@ -880,8 +1007,12 @@ class AnalysisConfigStore:
         return self.environment_config
 
 
-def _finite_number(value: float) -> float | None:
-    return float(value) if math.isfinite(float(value)) else None
+def _finite_number(value: Any) -> float | None:
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return None
+    return number if math.isfinite(number) else None
 
 
 def _values(data_array: xr.DataArray) -> np.ndarray:
@@ -999,10 +1130,101 @@ def _raise_validation_errors(errors: list[str]) -> None:
         raise ValueError("SNIRF 输入校验失败：" + "；".join(errors))
 
 
+def _time_coordinate_in_seconds(
+    amplitudes: xr.DataArray,
+) -> tuple[xr.DataArray, dict[str, Any]]:
+    """Return an analysis-only time axis expressed in seconds.
+
+    Cedalion preserves the numeric SNIRF time values and stores the unit on the
+    coordinate.  Most downstream fNIRS helpers consume seconds semantically, so
+    make that convention explicit before validating rates or constructing epochs.
+    The original SNIRF file and recording object remain untouched.
+    """
+    if "time" not in amplitudes.coords:
+        raise ValueError("SNIRF 输入校验失败：缺少 time 坐标")
+    raw_unit = amplitudes.time.attrs.get("units")
+    if raw_unit is None:
+        raise ValueError("SNIRF 输入校验失败：time 坐标缺少可转换为秒的单位")
+    try:
+        unit = cedalion.units.Unit(raw_unit)
+        seconds_per_unit = float((1 * unit).to("second").magnitude)
+    except Exception as exc:
+        raise ValueError(
+            f"SNIRF 输入校验失败：time 坐标单位 {raw_unit!r} 不能转换为秒"
+        ) from exc
+    if not math.isfinite(seconds_per_unit) or seconds_per_unit <= 0:
+        raise ValueError("SNIRF 输入校验失败：time 坐标单位换算无效")
+    try:
+        raw_time = np.asarray(amplitudes.time.values, dtype=np.float64)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("SNIRF 输入校验失败：时间坐标不是数值") from exc
+    analysis_time = raw_time * seconds_per_unit
+    normalised = amplitudes.assign_coords(time=("time", analysis_time))
+    normalised.time.attrs = {
+        **dict(amplitudes.time.attrs),
+        "units": cedalion.units.second,
+    }
+    return normalised, {
+        "source_time_unit": str(unit),
+        "analysis_time_unit": "second",
+        "seconds_per_source_time_unit": seconds_per_unit,
+        "converted": not math.isclose(seconds_per_unit, 1.0, rel_tol=0.0, abs_tol=1e-15),
+    }
+
+
+def _stimulus_in_seconds(
+    stimulus: Any,
+    seconds_per_source_time_unit: float,
+) -> tuple[Any, dict[str, Any]]:
+    """Copy stimulus timing into the analysis time unit without touching SNIRF."""
+    if stimulus is None:
+        return stimulus, {
+            "events": 0,
+            "converted": False,
+            "policy": "preserve_onset_duration_seconds",
+        }
+    normalised = stimulus.copy()
+    converted = not math.isclose(
+        seconds_per_source_time_unit, 1.0, rel_tol=0.0, abs_tol=1e-15
+    )
+    if converted:
+        for column in ("onset", "duration"):
+            if column not in normalised.columns:
+                continue
+            normalised[column] = [
+                value * seconds_per_source_time_unit
+                if (value := _finite_number(raw_value)) is not None
+                else raw_value
+                for raw_value in normalised[column]
+            ]
+    return normalised, {
+        "events": len(normalised),
+        "converted": converted,
+        "policy": "preserve_onset_duration_seconds",
+    }
+
+
+def _sampling_statistics(time: np.ndarray) -> dict[str, float]:
+    """Summarize an already validated, strictly increasing time axis."""
+    steps = np.diff(time)
+    interval = float(np.median(steps))
+    return {
+        "sampling_interval_seconds": interval,
+        "sample_rate_hz": float(1.0 / interval),
+        "maximum_sampling_deviation_fraction": float(
+            np.max(np.abs(steps - interval)) / interval
+        ),
+        "maximum_gap_seconds": float(np.max(steps)),
+        "large_gap_count": int(np.count_nonzero(steps > interval * 1.5)),
+    }
+
+
 def _validate_recording_input(
     amplitudes: xr.DataArray,
     stimulus: Any,
     config: AnalysisConfig,
+    *,
+    allow_resampling: bool = False,
 ) -> dict[str, Any]:
     """Validate signal structure before any OD or concentration calculation."""
     errors: list[str] = []
@@ -1037,6 +1259,7 @@ def _validate_recording_input(
     sample_rate: float | None = None
     sampling_interval: float | None = None
     is_uniform: bool | None = None
+    maximum_sampling_deviation_fraction: float | None = None
     if "time" in amplitudes.coords:
         try:
             time = np.asarray(amplitudes.time.values, dtype=np.float64)
@@ -1052,11 +1275,23 @@ def _validate_recording_input(
                 if np.any(steps <= 0):
                     errors.append("时间坐标必须严格递增")
                 else:
-                    sampling_interval = float(np.median(steps))
-                    sample_rate = float(1.0 / sampling_interval)
-                    is_uniform = bool(np.allclose(steps, sampling_interval, rtol=0.01, atol=1e-9))
-                    if not is_uniform:
-                        warnings.append("采样间隔不均匀，滤波结果需额外核对")
+                    statistics = _sampling_statistics(time)
+                    sampling_interval = statistics["sampling_interval_seconds"]
+                    sample_rate = statistics["sample_rate_hz"]
+                    maximum_sampling_deviation_fraction = statistics[
+                        "maximum_sampling_deviation_fraction"
+                    ]
+                    is_uniform = maximum_sampling_deviation_fraction <= 0.01 + 1e-12
+                    if not is_uniform and not allow_resampling:
+                        errors.append(
+                            "采样间隔不均匀（最大偏差 "
+                            f"{maximum_sampling_deviation_fraction * 100:.3g}%），"
+                            "固定采样率处理前必须先重采样"
+                        )
+                    elif not is_uniform:
+                        warnings.append(
+                            "采样间隔不均匀，将在固定采样率处理前执行受控重采样"
+                        )
                     if config.filter_max_hz >= sample_rate / 2:
                         errors.append(
                             f"滤波上限 {config.filter_max_hz:g} Hz 不低于 Nyquist "
@@ -1097,11 +1332,274 @@ def _validate_recording_input(
         "sample_rate_hz": sample_rate,
         "sampling_interval_seconds": sampling_interval,
         "sampling_is_uniform": is_uniform,
+        "maximum_sampling_deviation_fraction": maximum_sampling_deviation_fraction,
+        "resampling_required": is_uniform is False,
         "stimulus": {
             "events": stimulus_count,
             "columns": stimulus_columns,
         },
     }
+
+
+def _uniform_time_grid(
+    start_seconds: float,
+    end_seconds: float,
+    target_rate_hz: float,
+) -> tuple[np.ndarray, float]:
+    """Build an endpoint-preserving uniform grid and report its effective rate."""
+    duration = end_seconds - start_seconds
+    if not math.isfinite(duration) or duration <= 0:
+        raise ValueError("重采样失败：时间轴时长必须为有限正数")
+    interval_count = max(1, int(math.ceil(duration * target_rate_hz)))
+    target_time = np.linspace(
+        start_seconds,
+        end_seconds,
+        interval_count + 1,
+        dtype=np.float64,
+    )
+    effective_rate_hz = float(interval_count / duration)
+    return target_time, effective_rate_hz
+
+
+def _interpolation_brackets(
+    source_time: np.ndarray,
+    target_time: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Return exact-source flags and source bracket widths for target samples."""
+    insertion = np.searchsorted(source_time, target_time, side="left")
+    right = np.clip(insertion, 0, source_time.size - 1)
+    left = np.clip(right - 1, 0, source_time.size - 1)
+    exact = np.isclose(
+        target_time,
+        source_time[right],
+        rtol=0.0,
+        atol=max(1e-12, float(np.median(np.diff(source_time))) * 1e-8),
+    )
+    bracket_widths = source_time[right] - source_time[left]
+    bracket_widths[exact] = 0.0
+    return exact, bracket_widths
+
+
+def _interpolate_amplitudes_to_time(
+    amplitudes: xr.DataArray,
+    target_time: np.ndarray,
+) -> xr.DataArray:
+    """Linearly interpolate along time while preserving fNIRS coordinates/units."""
+    try:
+        units = amplitudes.pint.units
+        dequantified = amplitudes.pint.dequantify()
+    except Exception:
+        units = None
+        dequantified = amplitudes
+    attributes = dict(amplitudes.attrs)
+    interpolated = dequantified.interp(time=target_time, method="linear")
+    interpolated = interpolated.assign_coords(
+        time=("time", target_time),
+        samples=("time", np.arange(target_time.size, dtype=np.int64)),
+    )
+    interpolated.attrs = attributes
+    interpolated.time.attrs = {
+        **dict(amplitudes.time.attrs),
+        "units": cedalion.units.second,
+    }
+    if units is not None:
+        try:
+            interpolated = interpolated.pint.quantify(units)
+        except Exception as exc:
+            raise ValueError(f"重采样后无法恢复原始光强单位：{exc}") from exc
+    return interpolated
+
+
+def _stimulus_timing_snapshot(stimulus: Any) -> list[tuple[float | None, float | None]]:
+    """Capture numeric event timing so resampling cannot silently alter it."""
+    if stimulus is None:
+        return []
+    rows: list[tuple[float | None, float | None]] = []
+    columns = set(getattr(stimulus, "columns", []))
+    for _, event in stimulus.iterrows():
+        onset = _finite_number(event.get("onset")) if "onset" in columns else None
+        duration = (
+            _finite_number(event.get("duration")) if "duration" in columns else None
+        )
+        rows.append((onset, duration))
+    return rows
+
+
+def _resample_amplitudes(
+    amplitudes: xr.DataArray,
+    config: AnalysisConfig,
+    stimulus: Any = None,
+) -> tuple[xr.DataArray, dict[str, Any]]:
+    """Regularise a validated fNIRS time axis with bounded interpolation.
+
+    Cedalion's native resampler assumes the source is already uniform.  This
+    wrapper first validates the irregular axis, limits temporal gaps, rebuilds
+    `samples`, and uses Cedalion's frequency filter only after a uniform source
+    grid exists for anti-aliasing.
+    """
+    try:
+        source_time = np.asarray(amplitudes.time.values, dtype=np.float64)
+    except (AttributeError, TypeError, ValueError) as exc:
+        raise ValueError("重采样失败：无法读取数值 time 坐标") from exc
+    if (
+        source_time.size < 2
+        or not np.all(np.isfinite(source_time))
+        or np.any(np.diff(source_time) <= 0)
+    ):
+        raise ValueError("重采样失败：time 坐标必须至少包含两个严格递增的有限采样点")
+
+    source = _sampling_statistics(source_time)
+    source_rate_hz = source["sample_rate_hz"]
+    source_is_uniform = source["maximum_sampling_deviation_fraction"] <= 0.01 + 1e-12
+    requested_target_rate_hz = (
+        config.resampling_target_rate_hz
+        if config.resampling_target_rate_hz > 0
+        else source_rate_hz
+    )
+    target_time, effective_target_rate_hz = _uniform_time_grid(
+        float(source_time[0]),
+        float(source_time[-1]),
+        requested_target_rate_hz,
+    )
+    target_statistics = _sampling_statistics(target_time)
+    target_rate_hz = target_statistics["sample_rate_hz"]
+    has_explicit_target = config.resampling_target_rate_hz > 0
+    target_differs = not math.isclose(
+        target_rate_hz,
+        source_rate_hz,
+        rel_tol=1e-9,
+        abs_tol=1e-9,
+    )
+    should_resample = config.resampling_mode == "force" or (
+        config.resampling_mode == "auto"
+        and (not source_is_uniform or (has_explicit_target and target_differs))
+    )
+    event_before = _stimulus_timing_snapshot(stimulus)
+    base_audit: dict[str, Any] = {
+        "mode": config.resampling_mode,
+        "applied": should_resample,
+        "time_unit_policy": "analysis_time_axis_in_seconds",
+        "source_samples": int(source_time.size),
+        "target_samples": int(target_time.size) if should_resample else int(source_time.size),
+        "source_start_seconds": _finite_number(source_time[0]),
+        "source_end_seconds": _finite_number(source_time[-1]),
+        "target_start_seconds": _finite_number(target_time[0]) if should_resample else _finite_number(source_time[0]),
+        "target_end_seconds": _finite_number(target_time[-1]) if should_resample else _finite_number(source_time[-1]),
+        "source_sample_rate_hz": _finite_number(source_rate_hz),
+        "requested_target_rate_hz": _finite_number(requested_target_rate_hz),
+        "target_sample_rate_hz": _finite_number(target_rate_hz if should_resample else source_rate_hz),
+        "source_sampling_interval_seconds": _finite_number(source["sampling_interval_seconds"]),
+        "target_sampling_interval_seconds": _finite_number(
+            target_statistics["sampling_interval_seconds"]
+            if should_resample
+            else source["sampling_interval_seconds"]
+        ),
+        "source_sampling_is_uniform": source_is_uniform,
+        "target_sampling_is_uniform": True,
+        "source_maximum_sampling_deviation_fraction": _finite_number(
+            source["maximum_sampling_deviation_fraction"]
+        ),
+        "target_maximum_sampling_deviation_fraction": _finite_number(
+            target_statistics["maximum_sampling_deviation_fraction"]
+            if should_resample
+            else source["maximum_sampling_deviation_fraction"]
+        ),
+        "maximum_gap_seconds": _finite_number(source["maximum_gap_seconds"]),
+        "gap_count": int(source["large_gap_count"]),
+        "maximum_interpolation_gap_seconds": config.resampling_max_gap_seconds,
+        "interpolated_samples": 0,
+        "interpolated_fraction": 0.0,
+        "maximum_interpolation_bracket_seconds": 0.0,
+        "anti_aliasing": {
+            "applied": False,
+            "method": None,
+            "cutoff_hz": None,
+            "order": None,
+        },
+        "event_timing": {
+            "policy": "preserve_onset_duration_seconds",
+            "events": len(event_before),
+            "preserved": True,
+        },
+        "warnings": [],
+    }
+    if not should_resample:
+        if not source_is_uniform:
+            raise ValueError(
+                "SNIRF 输入校验失败：采样间隔不均匀，"
+                "重采样模式关闭，固定采样率处理前必须先重采样"
+            )
+        if config.resampling_mode == "off" and has_explicit_target:
+            base_audit["warnings"].append("重采样模式关闭，已忽略目标采样率")
+        return amplitudes, base_audit
+
+    if source["maximum_gap_seconds"] > config.resampling_max_gap_seconds + 1e-9:
+        raise ValueError(
+            "重采样拒绝：原始时间轴最大缺口 "
+            f"{source['maximum_gap_seconds']:.6g} 秒超过允许的 "
+            f"{config.resampling_max_gap_seconds:g} 秒"
+        )
+    if config.filter_max_hz >= target_rate_hz / 2:
+        raise ValueError(
+            f"重采样目标 Nyquist 频率 {target_rate_hz / 2:g} Hz "
+            f"不高于滤波上限 {config.filter_max_hz:g} Hz"
+        )
+
+    exact, brackets = _interpolation_brackets(source_time, target_time)
+    if brackets.size and np.max(brackets) > config.resampling_max_gap_seconds + 1e-9:
+        raise ValueError(
+            "重采样拒绝：目标采样需要跨越超过允许上限的时间缺口"
+        )
+    interpolated_samples = int(np.count_nonzero(~exact))
+    base_audit.update(
+        {
+            "interpolated_samples": interpolated_samples,
+            "interpolated_fraction": _finite_number(
+                interpolated_samples / target_time.size
+            ),
+            "maximum_interpolation_bracket_seconds": _finite_number(
+                np.max(brackets) if brackets.size else 0.0
+            ),
+        }
+    )
+
+    downsampling = target_rate_hz < source_rate_hz * (1 - 1e-9)
+    source_for_interpolation = amplitudes
+    if downsampling:
+        source_grid, source_grid_rate_hz = _uniform_time_grid(
+            float(source_time[0]),
+            float(source_time[-1]),
+            source_rate_hz,
+        )
+        source_for_interpolation = _interpolate_amplitudes_to_time(
+            amplitudes, source_grid
+        )
+        if not np.all(np.isfinite(_values(source_for_interpolation))):
+            raise ValueError(
+                "重采样拒绝：下采样前规则化光强包含非有限值，无法安全执行抗混叠"
+            )
+        cutoff_hz = min(0.45 * target_rate_hz, 0.45 * source_grid_rate_hz)
+        try:
+            source_for_interpolation = freq_filter(
+                source_for_interpolation,
+                0 * cedalion.units.Hz,
+                cutoff_hz * cedalion.units.Hz,
+                butter_order=8,
+            )
+        except Exception as exc:
+            raise ValueError(f"重采样抗混叠低通失败：{exc}") from exc
+        base_audit["anti_aliasing"] = {
+            "applied": True,
+            "method": "Cedalion 8th-order Butterworth lowpass",
+            "cutoff_hz": _finite_number(cutoff_hz),
+            "order": 8,
+        }
+
+    resampled = _interpolate_amplitudes_to_time(source_for_interpolation, target_time)
+    event_after = _stimulus_timing_snapshot(stimulus)
+    if event_before != event_after:
+        raise ValueError("重采样失败：事件 onset/duration 在分析过程中发生变化")
+    return resampled, base_audit
 
 
 def _normalise_amplitude_units(
@@ -1233,6 +1731,9 @@ def _prepare_amplitudes(
     keep = np.asarray(positive_fraction.values, dtype=np.float64) >= config.min_positive_fraction
     keep_indices = np.flatnonzero(keep)
     excluded_nonpositive_indices = np.flatnonzero(~keep)
+    excluded_labels = [
+        raw_channel_labels[index] for index in excluded_nonpositive_indices
+    ]
     if keep_indices.size == 0:
         raise ValueError(
             "没有通道在每个波长上达到 "
@@ -1241,18 +1742,69 @@ def _prepare_amplitudes(
 
     selected = dequantified.isel(channel=keep_indices)
     selected_valid = np.isfinite(selected) & (selected > 0)
+    time = np.asarray(selected.time.values, dtype=np.float64)
+    valid_values = np.asarray(
+        selected_valid.transpose("channel", "wavelength", "time").values,
+        dtype=bool,
+    )
+    interpolation_gap_channels: set[int] = set()
+    maximum_value_interpolation_gap_seconds = 0.0
+    for channel_index, channel_values in enumerate(valid_values):
+        for wavelength_values in channel_values:
+            invalid = np.flatnonzero(~wavelength_values)
+            if not invalid.size:
+                continue
+            run_starts = invalid[np.r_[True, np.diff(invalid) > 1]]
+            run_ends = invalid[np.r_[np.diff(invalid) > 1, True]]
+            for run_start, run_end in zip(run_starts, run_ends, strict=True):
+                if run_start == 0 or run_end == time.size - 1:
+                    interpolation_gap_channels.add(channel_index)
+                    continue
+                bracket_gap = float(time[run_end + 1] - time[run_start - 1])
+                maximum_value_interpolation_gap_seconds = max(
+                    maximum_value_interpolation_gap_seconds,
+                    bracket_gap,
+                )
+                if bracket_gap > config.resampling_max_gap_seconds + 1e-9:
+                    interpolation_gap_channels.add(channel_index)
+    if interpolation_gap_channels:
+        excluded_labels.extend(
+            str(selected.channel.values[index])
+            for index in sorted(interpolation_gap_channels)
+        )
+        retained = np.array(
+            [index for index in range(selected.sizes["channel"]) if index not in interpolation_gap_channels],
+            dtype=np.int64,
+        )
+        if not retained.size:
+            raise ValueError(
+                "所有候选通道的无效光强缺口都超过允许的 "
+                f"{config.resampling_max_gap_seconds:g} 秒，或位于记录端点"
+            )
+        selected = selected.isel(channel=retained)
+        selected_valid = selected_valid.isel(channel=retained)
     interpolated_samples = int((~selected_valid).sum().item())
     if interpolated_samples:
         selected = selected.where(selected_valid).interpolate_na(
             "time",
             method="linear",
-            fill_value="extrapolate",
         )
     remaining_invalid = int(
         (~(np.isfinite(selected) & (selected > 0))).sum().item()
     )
     if remaining_invalid:
-        raise ValueError(f"有效通道插值后仍有 {remaining_invalid} 个无效光强采样")
+        remaining_mask = ~(np.isfinite(selected) & (selected > 0))
+        invalid_by_channel = remaining_mask.any(dim=["wavelength", "time"])
+        invalid_indices = np.flatnonzero(np.asarray(invalid_by_channel.values, dtype=bool))
+        if invalid_indices.size == selected.sizes.get("channel", 0):
+            raise ValueError(f"有效通道插值后仍有 {remaining_invalid} 个无效光强采样")
+        excluded_labels.extend(
+            str(selected.channel.values[index]) for index in invalid_indices
+        )
+        keep_after_interpolation = np.flatnonzero(~np.asarray(invalid_by_channel.values, dtype=bool))
+        selected = selected.isel(channel=keep_after_interpolation)
+        if selected.sizes.get("channel", 0) == 0:
+            raise ValueError(f"有效通道插值后仍有 {remaining_invalid} 个无效光强采样")
 
     try:
         selected = selected.pint.quantify()
@@ -1260,13 +1812,16 @@ def _prepare_amplitudes(
         pass
     return selected, {
         "raw_channels": raw_channel_count,
-        "analyzed_channels": int(keep_indices.size),
-        "excluded_nonpositive_channels": raw_channel_count - int(keep_indices.size),
-        "excluded_nonpositive_channel_labels": [
-            raw_channel_labels[index] for index in excluded_nonpositive_indices
-        ],
+        "analyzed_channels": int(selected.sizes["channel"]),
+        "excluded_nonpositive_channels": raw_channel_count - int(selected.sizes["channel"]),
+        "excluded_nonpositive_channel_labels": list(dict.fromkeys(excluded_labels)),
         "interpolated_samples": interpolated_samples,
         "minimum_positive_fraction": config.min_positive_fraction,
+        "maximum_value_interpolation_gap_seconds": _finite_number(
+            maximum_value_interpolation_gap_seconds
+        ),
+        "maximum_allowed_value_interpolation_gap_seconds": config.resampling_max_gap_seconds,
+        "excluded_value_interpolation_gap_channels": len(interpolation_gap_channels),
     }
 
 
@@ -1291,6 +1846,15 @@ class AnalysisData:
     glm_summary: dict[str, Any]
     glm_condition_effects: list[dict[str, Any]]
     glm_contrast_effects: list[dict[str, Any]]
+    # Wavelet is an experimental comparison signal. Keep the OD/geometry inputs
+    # on the cached analysis object and materialise the result only when requested.
+    wavelet_geometry: xr.DataArray | None = field(default=None, repr=False, compare=False)
+    wavelet_dpf: xr.DataArray | None = field(default=None, repr=False, compare=False)
+    wavelet_filtered: xr.DataArray | None = field(default=None, repr=False, compare=False)
+    wavelet_lock: Any = field(default_factory=RLock, repr=False, compare=False)
+    glm_context: dict[str, Any] | None = field(default=None, repr=False, compare=False)
+    glm_state: str = field(default="pending", repr=False, compare=False)
+    glm_lock: Any = field(default_factory=RLock, repr=False, compare=False)
 
 
 def _channel_text(data: xr.DataArray, coordinate: str, channel: Any, fallback: str) -> str:
@@ -2022,9 +2586,23 @@ def _series_options(
     ]
 
 
-def _normalise_stimulus(recording: Any) -> Any:
+def _stimulus_with_durations(stimulus: Any) -> Any:
+    stim = stimulus.copy()
+    # SNIRF permits instantaneous events without a duration column. Cedalion's
+    # epoch/GLM helpers still receive a concrete zero duration in that case.
+    if "duration" not in stim.columns:
+        stim["duration"] = 0.0
+    else:
+        stim["duration"] = [
+            max(0.0, duration) if (duration := _finite_number(value)) is not None else 0.0
+            for value in stim["duration"]
+        ]
+    return stim
+
+
+def _normalise_stimulus(stimulus: Any) -> Any:
     """Give Cedalion's official finger-tapping fixture readable condition names."""
-    stim = recording.stim.copy()
+    stim = _stimulus_with_durations(stimulus)
     if "trial_type" not in stim.columns:
         return stim
     trial_types = stim["trial_type"].astype(str)
@@ -2047,7 +2625,14 @@ def _paired_stimulus_intervals(stim: Any) -> tuple[Any, list[dict[str, Any]]]:
     open_markers: dict[str, list[dict[str, Any]]] = {}
     rows: list[dict[str, Any]] = []
     intervals: list[dict[str, Any]] = []
-    for _, marker in stim.sort_values("onset").iterrows():
+    sortable = stim.copy()
+    sortable["_normalised_onset"] = [
+        _finite_number(value) for value in sortable["onset"]
+    ]
+    for _, marker in sortable.sort_values(
+        "_normalised_onset",
+        na_position="last",
+    ).iterrows():
         marker_name = str(marker["trial_type"])
         match = re.fullmatch(r"(.+)([SE])", marker_name)
         onset = _finite_number(marker["onset"])
@@ -2091,8 +2676,8 @@ def _paired_stimulus_intervals(stim: Any) -> tuple[Any, list[dict[str, Any]]]:
     return paired.sort_values("onset").reset_index(drop=True), intervals
 
 
-def _task_stimulus(recording: Any) -> tuple[Any, list[dict[str, Any]]]:
-    normalised = _normalise_stimulus(recording)
+def _task_stimulus(stimulus: Any) -> tuple[Any, list[dict[str, Any]]]:
+    normalised = _normalise_stimulus(stimulus)
     paired, intervals = _paired_stimulus_intervals(normalised)
     return (paired, intervals) if intervals else (normalised, [])
 
@@ -2110,7 +2695,11 @@ def _condition_rows(stim: Any) -> list[dict[str, Any]]:
         if condition in excluded:
             continue
         condition_stim = stim[stim["trial_type"].astype(str) == condition]
-        durations = np.asarray(condition_stim["duration"], dtype=np.float64)
+        durations = (
+            np.asarray(condition_stim["duration"], dtype=np.float64)
+            if "duration" in condition_stim.columns
+            else np.zeros(len(condition_stim), dtype=np.float64)
+        )
         durations = durations[np.isfinite(durations) & (durations >= 0)]
         result.append(
             {
@@ -2125,6 +2714,98 @@ def _condition_rows(stim: Any) -> list[dict[str, Any]]:
     return result
 
 
+def _filter_complete_task_events(
+    stim: Any,
+    trial_types: list[str],
+    signal_time: np.ndarray,
+    before: float,
+    after: float,
+) -> tuple[Any, dict[str, Any]]:
+    """Keep only task events whose complete configured epoch is observable.
+
+    Cedalion can silently omit events outside the epoch bounds. Filtering them
+    explicitly keeps condition counts, GVTD matching, and the audit manifest in
+    agreement with the epochs that are actually analyzed.
+    """
+    trial_type_set = set(trial_types)
+    task_mask = stim["trial_type"].astype(str).isin(trial_type_set)
+    selected = stim.loc[task_mask].copy()
+    signal_values = np.asarray(signal_time, dtype=np.float64)
+    finite_signal = signal_values[np.isfinite(signal_values)]
+    signal_start = float(np.min(finite_signal)) if finite_signal.size else None
+    signal_end = float(np.max(finite_signal)) if finite_signal.size else None
+    signal_steps = np.diff(finite_signal)
+    signal_steps = signal_steps[np.isfinite(signal_steps) & (signal_steps > 0)]
+    tolerance = max(
+        1e-9,
+        float(np.median(signal_steps) * 1e-6) if signal_steps.size else 1e-9,
+    )
+    audit: dict[str, Any] = {
+        "requested_events": int(len(selected)),
+        "included_events": 0,
+        "excluded_boundary_events": 0,
+        "excluded_incomplete_baseline": 0,
+        "excluded_incomplete_post_window": 0,
+        "excluded_invalid_onset": 0,
+        "before_seconds": float(before),
+        "after_seconds": float(after),
+        "signal_start_seconds": signal_start,
+        "signal_end_seconds": signal_end,
+        "conditions": [],
+    }
+    condition_audit: dict[str, dict[str, Any]] = {}
+    for condition in trial_types:
+        condition_audit[condition] = {
+            "value": condition,
+            "label": CONDITION_LABELS.get(condition, condition),
+            "requested_count": 0,
+            "included_count": 0,
+            "excluded_incomplete_baseline": 0,
+            "excluded_incomplete_post_window": 0,
+            "excluded_invalid_onset": 0,
+        }
+
+    keep_indices: list[Any] = []
+    for index, event in selected.iterrows():
+        condition = str(event.get("trial_type", ""))
+        details = condition_audit.setdefault(
+            condition,
+            {
+                "value": condition,
+                "label": CONDITION_LABELS.get(condition, condition),
+                "requested_count": 0,
+                "included_count": 0,
+                "excluded_incomplete_baseline": 0,
+                "excluded_incomplete_post_window": 0,
+                "excluded_invalid_onset": 0,
+            },
+        )
+        details["requested_count"] += 1
+        onset = _finite_number(event.get("onset"))
+        if onset is None or signal_start is None or signal_end is None:
+            details["excluded_invalid_onset"] += 1
+            audit["excluded_invalid_onset"] += 1
+            continue
+        incomplete_baseline = onset - before < signal_start - tolerance
+        incomplete_post = onset + after > signal_end + tolerance
+        if incomplete_baseline:
+            details["excluded_incomplete_baseline"] += 1
+            audit["excluded_incomplete_baseline"] += 1
+        if incomplete_post:
+            details["excluded_incomplete_post_window"] += 1
+            audit["excluded_incomplete_post_window"] += 1
+        if incomplete_baseline or incomplete_post:
+            audit["excluded_boundary_events"] += 1
+            continue
+        details["included_count"] += 1
+        keep_indices.append(index)
+
+    eligible = selected.loc[keep_indices].copy().reset_index(drop=True)
+    audit["included_events"] = int(len(eligible))
+    audit["conditions"] = list(condition_audit.values())
+    return eligible, audit
+
+
 def _build_task_analysis(
     stim: Any,
     concentration_task: xr.DataArray,
@@ -2133,6 +2814,7 @@ def _build_task_analysis(
     motion_clean_mask: np.ndarray | None,
     config: AnalysisConfig,
 ) -> tuple[dict[str, Any], xr.DataArray | None, xr.DataArray | None]:
+    stim = _stimulus_with_durations(stim)
     conditions = _condition_rows(stim)
     quality_passed_labels = [row["label"] for row in quality_rows if row["passed"]]
     short_excluded_labels: list[str] = []
@@ -2146,25 +2828,55 @@ def _build_task_analysis(
         ]
     epoch_before = config.epoch_before_seconds
     epoch_after = config.epoch_after_seconds
+    epoch_selection: dict[str, Any] = {
+        "requested_events": 0,
+        "included_events": 0,
+        "excluded_boundary_events": 0,
+        "excluded_incomplete_baseline": 0,
+        "excluded_incomplete_post_window": 0,
+        "excluded_invalid_onset": 0,
+        "before_seconds": float(epoch_before),
+        "after_seconds": float(epoch_after),
+        "signal_start_seconds": None,
+        "signal_end_seconds": None,
+        "conditions": [],
+    }
+    eligible_stim = stim.iloc[0:0].copy()
     if conditions:
         trial_types_for_window = [item["value"] for item in conditions]
-        task_stim_for_window = stim[stim["trial_type"].isin(trial_types_for_window)]
-        onsets = np.asarray(task_stim_for_window["onset"], dtype=np.float64)
-        onsets = onsets[np.isfinite(onsets)]
-        signal_time = np.asarray(concentration_task.time.values, dtype=np.float64)
-        if onsets.size and signal_time.size:
-            available_before = float(np.min(onsets) - signal_time[0])
-            epoch_before = min(config.epoch_before_seconds, max(0.0, available_before))
-        durations = [
-            float(item["duration_seconds"])
-            for item in conditions
-            if item.get("duration_seconds") is not None
-        ]
+        durations = []
+        if "duration" in stim.columns:
+            task_durations = np.asarray(
+                stim[stim["trial_type"].astype(str).isin(trial_types_for_window)]["duration"],
+                dtype=np.float64,
+            )
+            durations = [
+                float(value)
+                for value in task_durations
+                if np.isfinite(value) and value >= 0
+            ]
         if durations:
             epoch_after = max(config.epoch_after_seconds, max(durations))
+        signal_time = np.asarray(concentration_task.time.values, dtype=np.float64)
+        eligible_stim, epoch_selection = _filter_complete_task_events(
+            stim,
+            trial_types_for_window,
+            signal_time,
+            epoch_before,
+            epoch_after,
+        )
     summary: dict[str, Any] = {
         "available": False,
         "conditions": conditions,
+        "condition_counts": [
+            {
+                "value": item["value"],
+                "label": item["label"],
+                "total_count": item["count"],
+                "usable_count": 0,
+            }
+            for item in conditions
+        ],
         "motion_correction": (
             "TDDR + CBSI" if config.cbsi_mode == "on" else "TDDR"
         ),
@@ -2180,6 +2892,7 @@ def _build_task_analysis(
         "filter_hz": [config.filter_min_hz, config.filter_max_hz],
         "epoch_seconds": [-epoch_before, epoch_after],
         "baseline_seconds": [-epoch_before, 0.0],
+        "epoch_selection": epoch_selection,
         "response_window_seconds": [
             config.response_start_seconds,
             config.response_end_seconds,
@@ -2218,11 +2931,26 @@ def _build_task_analysis(
         else:
             summary["error"] = "没有通过 SNR/SCI 门限的通道"
         return summary, None, None
+    if len(eligible_stim) == 0:
+        summary["error"] = "没有事件同时具备完整的刺激前基线和刺激后窗口"
+        summary["warning"] = (
+            "边界事件已排除：没有可用于任务分析的完整分段"
+            if epoch_selection["excluded_boundary_events"]
+            else "没有可用于任务分析的有效刺激事件"
+        )
+        return summary, None, None
 
-    trial_types = [item["value"] for item in conditions]
+    trial_types = [
+        item["value"]
+        for item in epoch_selection.get("conditions", [])
+        if item.get("included_count", 0) > 0
+    ]
+    if not trial_types:
+        summary["error"] = "没有事件同时具备完整的刺激前基线和刺激后窗口"
+        return summary, None, None
     try:
         epochs = concentration_task.cd.to_epochs(
-            stim,
+            eligible_stim,
             trial_types,
             before=epoch_before * cedalion.units.s,
             after=epoch_after * cedalion.units.s,
@@ -2234,7 +2962,9 @@ def _build_task_analysis(
                 summary["gvtd"]["reason"] = "GVTD 不可用，未剔除任务试次"
             else:
                 sample_time = np.asarray(concentration_task.time.values, dtype=np.float64)
-                task_rows = stim[stim["trial_type"].isin(trial_types)]
+                task_rows = eligible_stim[
+                    eligible_stim["trial_type"].astype(str).isin(trial_types)
+                ]
                 onsets_by_condition: dict[str, list[float]] = defaultdict(list)
                 for _, event in task_rows.iterrows():
                     onset = _finite_number(event.get("onset"))
@@ -2265,7 +2995,13 @@ def _build_task_analysis(
                 epochs = epochs.isel(epoch=np.flatnonzero(keep_epoch))
                 if epochs.sizes.get("epoch", 0) == 0:
                     raise ValueError("GVTD 剔除后没有可用任务片段")
-        baseline = epochs.sel(reltime=epochs.reltime < 0).mean("reltime")
+        baseline_mask = np.asarray(epochs.reltime.values < 0, dtype=bool)
+        if not np.any(baseline_mask):
+            raise ValueError("任务分段没有可用的刺激前基线采样")
+        baseline = epochs.isel(reltime=np.flatnonzero(baseline_mask)).mean("reltime")
+        baseline_values = _values(baseline)
+        if not np.all(np.isfinite(baseline_values)):
+            raise ValueError("刺激前基线包含非有限值，任务平均不可用")
         epochs = epochs - baseline
         average = epochs.groupby("trial_type").mean("epoch")
         deviation = epochs.groupby("trial_type").std("epoch")
@@ -2273,6 +3009,14 @@ def _build_task_analysis(
             str(condition): int(np.count_nonzero(epochs.trial_type.values == condition))
             for condition in average.trial_type.values
         }
+        epoch_selection["usable_events"] = int(epochs.sizes["epoch"])
+        epoch_selection["excluded_gvtd_epochs"] = int(
+            summary["gvtd"].get("excluded_epochs", 0)
+        )
+        for condition_audit in epoch_selection.get("conditions", []):
+            condition_audit["usable_count"] = count_by_condition.get(
+                condition_audit["value"], 0
+            )
         count_array = xr.DataArray(
             [count_by_condition[str(condition)] for condition in average.trial_type.values],
             dims="trial_type",
@@ -2282,7 +3026,9 @@ def _build_task_analysis(
         standard_error = standard_error.where(count_array > 1)
         average = average.sel(channel=passed_labels)
         standard_error = standard_error.sel(channel=passed_labels)
-        task_stim = stim[stim["trial_type"].isin(trial_types)]
+        task_stim = eligible_stim[
+            eligible_stim["trial_type"].astype(str).isin(trial_types)
+        ]
         durations = np.asarray(task_stim["duration"], dtype=np.float64)
         durations = durations[np.isfinite(durations)]
         summary["stimulus_duration_seconds"] = (
@@ -2292,16 +3038,36 @@ def _build_task_analysis(
         conditions = [
             {
                 **item,
+                "total_count": item["count"],
                 "count": count_by_condition[item["value"]],
+                "usable_count": count_by_condition[item["value"]],
             }
             for item in conditions
             if item["value"] in available_conditions
         ]
         summary["conditions"] = conditions
+        summary["condition_counts"] = [
+            {
+                "value": item["value"],
+                "label": item["label"],
+                "total_count": item["count"],
+                "usable_count": count_by_condition.get(item["value"], 0),
+            }
+            for item in _condition_rows(stim)
+        ]
         single_trial = [item["label"] for item in conditions if item["count"] < 2]
         summary["single_trial_conditions"] = single_trial
+        warnings: list[str] = []
+        if epoch_selection["excluded_boundary_events"]:
+            warnings.append(
+                "已排除 "
+                f"{epoch_selection['excluded_boundary_events']} 个边界不完整任务事件"
+            )
         if single_trial:
-            summary["warning"] = "单次任务区间仅用于查看，不能进行重复试次统计"
+            warnings.append("单次任务区间仅用于查看，不能进行重复试次统计")
+        if warnings:
+            summary["warnings"] = warnings
+            summary["warning"] = "；".join(warnings)
         summary["available"] = True
         summary["epochs"] = int(epochs.sizes["epoch"])
         return summary, average, standard_error
@@ -2518,6 +3284,7 @@ def _build_glm_analysis(
     TDDR spectrum for its prewhitening step. Cosine drift regressors model slow
     trends within the fit so coefficients retain the design information.
     """
+    stim = _stimulus_with_durations(stim)
     conditions = _condition_rows(stim)
     contrasts = [
         {
@@ -2773,6 +3540,320 @@ def _build_glm_analysis(
     return summary, condition_effects, contrast_effects
 
 
+def _inference_readiness(
+    condition_counts: list[dict[str, Any]],
+    task_available: bool,
+    glm_available: bool,
+    minimum_trials_per_condition: int = 2,
+) -> dict[str, Any]:
+    """Describe whether computed GLM values have a minimum repeat-trial basis.
+
+    This is deliberately a guardrail, not a power calculation: two usable
+    trials is only the minimum threshold used to prevent single-trial results
+    from being presented as confirmatory inference.
+    """
+    normalised: list[dict[str, Any]] = []
+    for item in condition_counts:
+        value = str(item.get("value", ""))
+        label = str(item.get("label", value))
+        total_count = item.get("total_count", item.get("count", 0))
+        usable_count = item.get("usable_count", item.get("count", 0))
+        try:
+            total_count = max(0, int(total_count))
+        except (TypeError, ValueError):
+            total_count = 0
+        try:
+            usable_count = max(0, int(usable_count))
+        except (TypeError, ValueError):
+            usable_count = 0
+        normalised.append(
+            {
+                "value": value,
+                "label": label,
+                "total_count": total_count,
+                "usable_count": usable_count,
+            }
+        )
+
+    insufficient = [
+        item for item in normalised if item["usable_count"] < minimum_trials_per_condition
+    ]
+    if not task_available or not glm_available:
+        state = "unavailable"
+        interpretation_level = "unavailable"
+        if not task_available and not glm_available:
+            reason = "任务分段和 GLM 均不可用，无法进行重复试次就绪度判断"
+        elif not task_available:
+            reason = "任务分段不可用，无法确认可用重复试次数"
+        else:
+            reason = "GLM 拟合不可用，不能提供统计结果"
+    elif not normalised:
+        state = "unavailable"
+        interpretation_level = "unavailable"
+        reason = "没有可识别的任务条件"
+    elif insufficient:
+        state = "exploratory"
+        interpretation_level = "exploratory"
+        reason = (
+            f"至少一个条件少于 {minimum_trials_per_condition} 个可用重复试次，"
+            "GLM 数值仅供探索性查看，不应作为确认性结论"
+        )
+    else:
+        state = "ready"
+        interpretation_level = "inferential"
+        reason = (
+            f"所有条件均达到至少 {minimum_trials_per_condition} 个可用重复试次的最低门槛；"
+            "这不等同于统计功效或研究结论已经充分"
+        )
+
+    return {
+        "state": state,
+        "status": (
+            "unavailable"
+            if state == "unavailable"
+            else "exploratory_only"
+            if state == "exploratory"
+            else "repeated_trials_minimum_met"
+        ),
+        "interpretation_level": interpretation_level,
+        "ready": state == "ready",
+        "inference_ready": state == "ready",
+        "minimum_trials_per_condition": minimum_trials_per_condition,
+        "minimum_repetitions_per_condition": minimum_trials_per_condition,
+        "condition_counts": normalised,
+        "insufficient_conditions": [item["label"] for item in insufficient],
+        "insufficient_condition_values": [item["value"] for item in insufficient],
+        "reason": reason,
+    }
+
+
+def _pending_glm_summary(
+    task_summary: dict[str, Any],
+    config: AnalysisConfig,
+    short_channel_count: int,
+    auxiliary_signal_count: int,
+) -> dict[str, Any]:
+    """Build a stable, explicit placeholder before the optional GLM fit."""
+    readiness = _inference_readiness(
+        task_summary.get("condition_counts", []),
+        bool(task_summary.get("available")),
+        False,
+    )
+    readiness.update(
+        {
+            "state": "pending",
+            "status": "pending",
+            "interpretation_level": "pending",
+            "pending": True,
+            "reason": "GLM 尚未计算；请求 GLM 结果或报告时将按需拟合。",
+        }
+    )
+    conditions = [dict(item) for item in task_summary.get("conditions", [])]
+    return {
+        "available": False,
+        "status": "pending",
+        "computed": False,
+        "method": "Cedalion task GLM",
+        "conditions": conditions,
+        "contrasts": [],
+        "channel_labels": [],
+        "channels": 0,
+        "model": {
+            "noise_model": config.glm_noise_model,
+            "requested_noise_model": config.glm_noise_model,
+        },
+        "short_separation": {
+            "requested_mode": config.glm_short_separation_mode,
+            "applied": False,
+            "candidate_channels": short_channel_count,
+            "used_channels": [],
+            "reason": "GLM 尚未建立，等待按需拟合。",
+        },
+        "auxiliary": {
+            "requested": config.glm_nuisance_mode in {"auxiliary", "auxiliary_global"},
+            "applied": False,
+            "available_signals": auxiliary_signal_count,
+            "reason": "GLM 尚未建立，等待按需拟合。",
+        },
+        "global": {
+            "requested": config.glm_nuisance_mode in {"global", "auxiliary_global"},
+            "applied": False,
+            "self_included": True,
+            "reason": "GLM 尚未建立，等待按需拟合。",
+        },
+        "gvtd": {
+            "mode": config.gvtd_mode,
+            "applied": False,
+            "excluded_samples": 0,
+            "retained_samples": None,
+            "total_samples": None,
+            "retained_fraction": None,
+            "reason": "GLM 尚未建立，等待按需拟合。",
+        },
+        "regressors": [],
+        "condition_counts": readiness["condition_counts"],
+        "inference_readiness": readiness,
+        "error": "GLM 尚未计算；请求 GLM 结果或报告时将按需拟合。",
+    }
+
+
+def _finalize_glm_metadata(
+    analysis: AnalysisData,
+    glm_summary: dict[str, Any],
+    glm_condition_effects: list[dict[str, Any]],
+    glm_contrast_effects: list[dict[str, Any]],
+) -> None:
+    """Apply a completed GLM atomically to all dependent summaries."""
+    context = analysis.glm_context or {}
+    task_summary = analysis.task_summary
+    nuisance_regression = analysis.summary["nuisance_regression"]
+    auxiliary_signals = context.get("auxiliary_signals")
+    if auxiliary_signals is None:
+        auxiliary_signals = analysis.summary["input_validation"]["auxiliary"]
+    cbsi_requested = bool(context.get("cbsi_requested", False))
+    cbsi_applied = bool(context.get("cbsi_applied", False))
+
+    if cbsi_requested and not cbsi_applied:
+        task_summary["motion_correction"] = "TDDR"
+        task_summary["cbsi"].update(
+            {
+                "applied": False,
+                "reason": "已请求 CBSI，但没有可安全估计标准差比例的通道",
+            }
+        )
+        model = glm_summary.get("model", {})
+        if isinstance(model.get("input"), str):
+            model["input"] = model["input"].replace(" and CBSI-corrected", "")
+        if isinstance(model.get("cbsi"), dict):
+            model["cbsi"]["applied"] = False
+
+    inference_readiness = _inference_readiness(
+        task_summary.get("condition_counts", []),
+        bool(task_summary.get("available")),
+        bool(glm_summary.get("available")),
+    )
+    inference_readiness["pending"] = False
+    task_summary["inference_readiness"] = inference_readiness
+    glm_summary["inference_readiness"] = inference_readiness
+    glm_summary["condition_counts"] = inference_readiness["condition_counts"]
+    glm_summary["computed"] = True
+    if glm_summary.get("status") != "failed":
+        glm_summary["status"] = "ready" if glm_summary.get("available") else "unavailable"
+    usable_by_value = {
+        item["value"]: item for item in inference_readiness["condition_counts"]
+    }
+    for condition in glm_summary.get("conditions", []):
+        counts = usable_by_value.get(condition["value"], {})
+        condition["total_count"] = counts.get("total_count", condition.get("count", 0))
+        condition["usable_count"] = counts.get("usable_count", 0)
+
+    auxiliary_signals["used_for_analysis"] = bool(
+        glm_summary.get("auxiliary", {}).get("applied")
+    )
+    auxiliary_signals["regression_applied"] = bool(
+        glm_summary.get("auxiliary", {}).get("applied")
+    )
+    auxiliary_signals["regression_reason"] = glm_summary.get("auxiliary", {}).get(
+        "reason", "GLM 未建立"
+    )
+    task_summary["glm"] = glm_summary
+    short_separation = analysis.summary["short_separation"]
+    nuisance_regression["short_separation"] = {
+        "applied": glm_summary.get("short_separation", {}).get("applied", False),
+        "available_channels": short_separation["short_channel_count"],
+        "scope": "task_glm_only",
+        "reason": glm_summary.get("short_separation", {}).get(
+            "reason", "GLM 未建立"
+        ),
+    }
+    nuisance_regression["auxiliary"] = {
+        **glm_summary.get("auxiliary", {}),
+        "available_signals": auxiliary_signals["count"],
+        "scope": "task_glm_only",
+    }
+    nuisance_regression["global"] = {
+        **glm_summary.get("global", {}),
+        "scope": "task_glm_only",
+    }
+    task_short_exclusions = set(
+        task_summary.get("short_separation", {}).get("excluded_channel_labels", [])
+    )
+    short_channel_labels = set(context.get("short_channel_labels", set()))
+    for row in analysis.quality:
+        row["short_separation"] = (
+            "short" if row["label"] in short_channel_labels else "long"
+        )
+        row["task_channel_eligible"] = bool(
+            row["passed"] and row["label"] not in task_short_exclusions
+        )
+
+    analysis.glm_summary = glm_summary
+    analysis.glm_condition_effects = glm_condition_effects
+    analysis.glm_contrast_effects = glm_contrast_effects
+
+
+def _ensure_glm_analysis(analysis: AnalysisData) -> AnalysisData:
+    """Fit GLM once for a cached analysis object and reuse its terminal state."""
+    if analysis.glm_state != "pending":
+        return analysis
+    with analysis.glm_lock:
+        if analysis.glm_state != "pending":
+            return analysis
+        context = analysis.glm_context
+        if context is None:
+            analysis.glm_summary["status"] = "unavailable"
+            analysis.glm_summary["computed"] = True
+            analysis.glm_summary["error"] = "GLM 上下文不可用"
+            analysis.glm_state = "unavailable"
+            return analysis
+
+        try:
+            glm_summary, condition_effects, contrast_effects = _build_glm_analysis(
+                context["stim"],
+                context["concentration"],
+                context["quality_rows"],
+                context["short_channel_labels"],
+                context["geo3d"],
+                context["auxiliary_timeseries"],
+                context["recording_time_unit"],
+                context["config"],
+                motion_clean_mask=context["motion_clean_mask"],
+            )
+        except Exception as exc:
+            glm_summary = _pending_glm_summary(
+                analysis.task_summary,
+                analysis.config,
+                analysis.summary["short_separation"]["short_channel_count"],
+                context["auxiliary_signals"]["count"],
+            )
+            glm_summary.update(
+                {
+                    "status": "failed",
+                    "computed": True,
+                    "error": f"GLM 拟合失败：{exc}",
+                }
+            )
+            condition_effects, contrast_effects = [], []
+
+        _finalize_glm_metadata(
+            analysis,
+            glm_summary,
+            condition_effects,
+            contrast_effects,
+        )
+        analysis.glm_state = (
+            "ready" if glm_summary.get("available") else glm_summary.get("status", "unavailable")
+        )
+        analysis.glm_context = None
+    return analysis
+
+
+def _ensure_glm_if_pending(analysis: AnalysisData) -> None:
+    """Ensure real cached analyses are fitted without disturbing fixture objects."""
+    if analysis.glm_state == "pending" and analysis.glm_context is not None:
+        _ensure_glm_analysis(analysis)
+
+
 @lru_cache(maxsize=3)
 def _load_analysis_cached(
     filename: str,
@@ -2801,12 +3882,50 @@ def _load_analysis_cached(
     if "amp" not in recording.timeseries:
         raise ValueError("SNIRF 中没有原始光强 amp 数据")
 
-    input_validation = _validate_recording_input(
-        recording["amp"],
+    analysis_raw_amplitudes, time_normalisation = _time_coordinate_in_seconds(
+        recording["amp"]
+    )
+    analysis_stimulus, stimulus_normalisation = _stimulus_in_seconds(
         recording.stim,
+        time_normalisation["seconds_per_source_time_unit"],
+    )
+    input_validation = _validate_recording_input(
+        analysis_raw_amplitudes,
+        analysis_stimulus,
+        config,
+        allow_resampling=config.resampling_mode != "off",
+    )
+    amplitudes, resampling_audit = _resample_amplitudes(
+        analysis_raw_amplitudes,
+        config,
+        analysis_stimulus,
+    )
+    effective_validation = _validate_recording_input(
+        amplitudes,
+        analysis_stimulus,
         config,
     )
-    amplitudes, preprocessing = _prepare_amplitudes(recording["amp"], config)
+    input_validation["analysis_sample_rate_hz"] = effective_validation[
+        "sample_rate_hz"
+    ]
+    input_validation["analysis_sampling_interval_seconds"] = effective_validation[
+        "sampling_interval_seconds"
+    ]
+    input_validation["analysis_sampling_is_uniform"] = effective_validation[
+        "sampling_is_uniform"
+    ]
+    input_validation["time_normalisation"] = time_normalisation
+    input_validation["stimulus_time_normalisation"] = stimulus_normalisation
+    input_validation["resampling"] = resampling_audit
+    input_validation["warnings"] = list(
+        dict.fromkeys(
+            input_validation["warnings"]
+            + effective_validation["warnings"]
+            + resampling_audit["warnings"]
+        )
+    )
+    amplitudes, preprocessing = _prepare_amplitudes(amplitudes, config)
+    preprocessing["resampling"] = resampling_audit
     amplitudes, unit_metadata = _normalise_amplitude_units(
         amplitudes,
         input_validation,
@@ -2870,26 +3989,19 @@ def _load_analysis_cached(
         config.filter_min_hz * cedalion.units.Hz,
         config.filter_max_hz * cedalion.units.Hz,
     )
-    optical_density_wavelet = motion.wavelet(optical_density)
-    concentration_wavelet = cw.od2conc(
-        optical_density_wavelet,
-        recording.geo3d,
-        dpf,
-        spectrum="prahl",
-    ).pint.to("micromolar")
-    concentration_wavelet_filtered = freq_filter(
-        concentration_wavelet,
-        config.filter_min_hz * cedalion.units.Hz,
-        config.filter_max_hz * cedalion.units.Hz,
-    )
-
     channels = _build_channels(amplitudes)
+    distance_by_label = {
+        item["label"]: item.get("distance_mm")
+        for item in short_separation["channels"]
+    }
+    for channel in channels:
+        channel["distance_mm"] = distance_by_label.get(channel["label"])
     manual_bad_labels = set(manual_qc["bad_channel_labels"])
     quality_rows, quality_summary = _quality_rows(
         amplitudes, channels, config, manual_bad_labels
     )
     motion_summary, motion_segments, motion_clean_mask = _motion_quality(amplitudes)
-    task_stim, intervals = _task_stimulus(recording)
+    task_stim, intervals = _task_stimulus(analysis_stimulus)
     short_channel_labels = {
         channel["label"] for channel in short_separation["short_channels"]
     }
@@ -2931,52 +4043,14 @@ def _load_analysis_cached(
         motion_clean_mask,
         config,
     )
-    glm_summary, glm_condition_effects, glm_contrast_effects = _build_glm_analysis(
-        task_stim,
-        concentration_glm,
-        quality_rows,
-        short_channel_labels,
-        recording.geo3d,
-        recording.aux_ts,
-        str(recording.meta_data.get("TimeUnit", "unknown")),
+    glm_summary = _pending_glm_summary(
+        task_summary,
         config,
-        motion_clean_mask=motion_clean_mask,
+        short_separation["short_channel_count"],
+        auxiliary_signals["count"],
     )
-    if cbsi_requested and not cbsi_applied:
-        task_summary["motion_correction"] = "TDDR"
-        task_summary["cbsi"].update(
-            {
-                "applied": False,
-                "reason": "已请求 CBSI，但没有可安全估计标准差比例的通道",
-            }
-        )
-        glm_summary["model"]["input"] = glm_summary["model"]["input"].replace(
-            " and CBSI-corrected", ""
-        )
-        glm_summary["model"]["cbsi"]["applied"] = False
-    auxiliary_signals["used_for_analysis"] = bool(
-        glm_summary["auxiliary"]["applied"]
-    )
-    auxiliary_signals["regression_applied"] = bool(
-        glm_summary["auxiliary"]["applied"]
-    )
-    auxiliary_signals["regression_reason"] = glm_summary["auxiliary"]["reason"]
+    task_summary["inference_readiness"] = glm_summary["inference_readiness"]
     task_summary["glm"] = glm_summary
-    nuisance_regression["short_separation"] = {
-        "applied": glm_summary["short_separation"]["applied"],
-        "available_channels": short_separation["short_channel_count"],
-        "scope": "task_glm_only",
-        "reason": glm_summary["short_separation"]["reason"],
-    }
-    nuisance_regression["auxiliary"] = {
-        **glm_summary["auxiliary"],
-        "available_signals": auxiliary_signals["count"],
-        "scope": "task_glm_only",
-    }
-    nuisance_regression["global"] = {
-        **glm_summary["global"],
-        "scope": "task_glm_only",
-    }
     task_short_exclusions = set(
         task_summary["short_separation"]["excluded_channel_labels"]
     )
@@ -2995,7 +4069,7 @@ def _load_analysis_cached(
     sample_rate = float(1.0 / np.median(time_steps)) if time_steps.size else None
     duration = float(time[-1] - time[0]) if time.size > 1 else 0.0
 
-    normalised_stim = _normalise_stimulus(recording)
+    normalised_stim = _normalise_stimulus(analysis_stimulus)
     trial_types: list[str] = []
     if "trial_type" in normalised_stim.columns:
         trial_types = [str(value) for value in normalised_stim["trial_type"].tolist()]
@@ -3052,7 +4126,7 @@ def _load_analysis_cached(
         "duration_seconds": duration,
         "sample_rate_hz": sample_rate,
         "wavelengths_nm": wavelengths,
-        "stimulus_events": len(recording.stim),
+        "stimulus_events": len(analysis_stimulus),
         "task_intervals": len(intervals),
         "trial_types": [item["label"] for item in event_counts],
         "cedalion_version": cedalion.__version__,
@@ -3070,12 +4144,24 @@ def _load_analysis_cached(
                 **{
                     key: value
                     for key, value in input_validation.items()
-                    if key not in {"warnings", "stimulus"}
+                    if key
+                    not in {
+                        "warnings",
+                        "stimulus",
+                        "resampling",
+                        "time_normalisation",
+                        "stimulus_time_normalisation",
+                    }
                 },
                 "analysis_unit": unit_metadata["analysis_unit"],
                 "normalised": unit_metadata["normalised"],
             },
             "stimulus": input_validation["stimulus"],
+            "time_normalisation": input_validation["time_normalisation"],
+            "stimulus_time_normalisation": input_validation[
+                "stimulus_time_normalisation"
+            ],
+            "resampling": input_validation["resampling"],
             "geometry": geometry_validation,
             "auxiliary": auxiliary_signals,
         },
@@ -3088,7 +4174,6 @@ def _load_analysis_cached(
         "conc_filtered": concentration_filtered,
         "conc_tddr_filtered": concentration_tddr_filtered,
         "conc_tddr_cbsi_filtered": concentration_tddr_cbsi_filtered,
-        "conc_wavelet_filtered": concentration_wavelet_filtered,
     }
     return AnalysisData(
         summary=summary,
@@ -3108,8 +4193,24 @@ def _load_analysis_cached(
         task_average=task_average,
         task_sem=task_sem,
         glm_summary=glm_summary,
-        glm_condition_effects=glm_condition_effects,
-        glm_contrast_effects=glm_contrast_effects,
+        glm_condition_effects=[],
+        glm_contrast_effects=[],
+        wavelet_geometry=recording.geo3d,
+        wavelet_dpf=dpf,
+        glm_context={
+            "stim": task_stim,
+            "concentration": concentration_glm,
+            "quality_rows": quality_rows,
+            "short_channel_labels": short_channel_labels,
+            "geo3d": recording.geo3d,
+            "auxiliary_timeseries": recording.aux_ts,
+            "recording_time_unit": str(recording.meta_data.get("TimeUnit", "unknown")),
+            "config": config,
+            "motion_clean_mask": motion_clean_mask,
+            "auxiliary_signals": auxiliary_signals,
+            "cbsi_requested": cbsi_requested,
+            "cbsi_applied": cbsi_applied,
+        },
     )
 
 
@@ -3118,6 +4219,7 @@ def load_analysis(
     config: AnalysisConfig | None = None,
     recording_id: str | None = None,
     qc_decisions: dict[str, Any] | None = None,
+    include_glm: bool = True,
 ) -> AnalysisData:
     path = path.resolve()
     stat = path.stat()
@@ -3125,10 +4227,10 @@ def load_analysis(
     recording_id = recording_id or path.name
     qc_decisions = qc_decisions or {"bad_channel_labels": [], "updated_at_utc": None}
     manual_qc_json = json.dumps(qc_decisions, ensure_ascii=True, sort_keys=True)
-    # The dashboard requests summary and quality data concurrently. Serialize the
-    # first cache miss so both requests share one Cedalion/GLM calculation.
+    # Serialize the first cache miss so concurrent endpoints share one base
+    # Cedalion calculation. GLM fitting has its own per-analysis lock below.
     with ANALYSIS_LOAD_LOCK:
-        return _load_analysis_cached(
+        analysis = _load_analysis_cached(
             str(path),
             stat.st_mtime_ns,
             stat.st_size,
@@ -3136,6 +4238,37 @@ def load_analysis(
             recording_id,
             manual_qc_json,
         )
+    if include_glm:
+        _ensure_glm_analysis(analysis)
+    return analysis
+
+
+def _wavelet_filtered_signal(analysis: AnalysisData) -> xr.DataArray:
+    """Compute the experimental Wavelet comparison signal on first use."""
+    with analysis.wavelet_lock:
+        if analysis.wavelet_filtered is not None:
+            return analysis.wavelet_filtered
+
+        optical_density = analysis.series.get("od")
+        if optical_density is None:
+            raise ValueError("Wavelet 信号缺少光密度输入")
+        if analysis.wavelet_geometry is None or analysis.wavelet_dpf is None:
+            raise ValueError("Wavelet 信号缺少探头几何或 DPF 参数")
+
+        optical_density_wavelet = motion.wavelet(optical_density)
+        concentration_wavelet = cw.od2conc(
+            optical_density_wavelet,
+            analysis.wavelet_geometry,
+            analysis.wavelet_dpf,
+            spectrum="prahl",
+        ).pint.to("micromolar")
+        filtered = freq_filter(
+            concentration_wavelet,
+            analysis.config.filter_min_hz * cedalion.units.Hz,
+            analysis.config.filter_max_hz * cedalion.units.Hz,
+        )
+        analysis.wavelet_filtered = filtered
+        return filtered
 
 
 def signal_payload(
@@ -3145,12 +4278,16 @@ def signal_payload(
     component: str | None,
     max_points: int,
 ) -> dict[str, Any]:
-    if kind not in analysis.series:
+    if kind != "conc_wavelet_filtered" and kind not in analysis.series:
         raise ValueError(f"不支持的分析类型：{kind}")
     if channel_index < 0 or channel_index >= len(analysis.channels):
         raise IndexError("通道编号超出范围")
 
-    data = analysis.series[kind]
+    data = (
+        _wavelet_filtered_signal(analysis)
+        if kind == "conc_wavelet_filtered"
+        else analysis.series[kind]
+    )
     channel = analysis.channels[channel_index]
     selected = data.sel(channel=channel["label"])
     if "wavelength" in selected.dims:
@@ -3306,6 +4443,10 @@ def task_response_payload(
     return {
         "condition": condition_row,
         "channel": channel,
+        "inference_readiness": analysis.task_summary.get(
+            "inference_readiness",
+            analysis.glm_summary.get("inference_readiness", {}),
+        ),
         "unit": "µM",
         "stimulus": {
             "onset_seconds": 0.0,
@@ -3326,6 +4467,7 @@ def task_response_payload(
 
 def analysis_metadata_payload(analysis: AnalysisData) -> dict[str, Any]:
     """Return the complete, JSON-safe manifest for one cached analysis run."""
+    _ensure_glm_if_pending(analysis)
     summary = analysis.summary
     analysis_info = summary["analysis"]
     task_summary = {
@@ -3371,6 +4513,7 @@ def analysis_metadata_payload(analysis: AnalysisData) -> dict[str, Any]:
             ],
             "interpolated_samples": summary["interpolated_samples"],
             "minimum_positive_fraction": summary["minimum_positive_fraction"],
+            "resampling": summary["resampling"],
         },
         "quality_control": {
             "summary": analysis.quality_summary,
@@ -3417,11 +4560,31 @@ def task_csv_bytes(
     writer = csv.writer(output)
     analysis_info = analysis.summary["analysis"]
     recording_id = analysis.summary["recording"]["id"]
+    readiness = analysis.task_summary.get(
+        "inference_readiness",
+        analysis.glm_summary.get("inference_readiness", {}),
+    )
+    condition_count = next(
+        (
+            item
+            for item in readiness.get("condition_counts", [])
+            if item.get("value") == condition_row["value"]
+        ),
+        {},
+    )
     writer.writerow(
         [
             "analysis_id",
             "input_sha256",
             "recording_id",
+            "condition",
+            "condition_label",
+            "usable_trials",
+            "total_trials",
+            "repeat_trial_ready",
+            "inference_state",
+            "inference_ready",
+            "inference_reason",
             "relative_time_s",
             "HbO_uM",
             "HbO_SEM_uM",
@@ -3441,6 +4604,14 @@ def task_csv_bytes(
                 analysis_info["id"],
                 analysis_info["input_sha256"],
                 recording_id,
+                condition_row["value"],
+                condition_row["label"],
+                condition_count.get("usable_count", condition_row.get("count", 0)),
+                condition_count.get("total_count", condition_row.get("count", 0)),
+                bool(condition_count.get("usable_count", condition_row.get("count", 0)) >= readiness.get("minimum_trials_per_condition", 2)),
+                readiness.get("state", "unavailable"),
+                bool(readiness.get("ready", False)),
+                readiness.get("reason", ""),
                 *[
                     "" if not math.isfinite(float(value)) else float(value)
                     for value in values
@@ -3471,10 +4642,15 @@ def _glm_condition(
 
 
 def _glm_channel(analysis: AnalysisData, channel_index: int) -> dict[str, Any]:
+    modelled = set(analysis.glm_summary.get("channel_labels", []))
+    if channel_index == -1:
+        for channel in analysis.quality:
+            if channel["label"] in modelled:
+                return channel
+        raise ValueError("当前 GLM 没有可用建模通道")
     if channel_index < 0 or channel_index >= len(analysis.quality):
         raise IndexError("通道编号超出范围")
     channel = analysis.quality[channel_index]
-    modelled = set(analysis.glm_summary.get("channel_labels", []))
     if channel["label"] not in modelled:
         raise ValueError(f"通道 {channel['label']} 未纳入当前 GLM")
     return channel
@@ -3500,6 +4676,7 @@ def task_glm_payload(
     channel_index: int,
     contrast: str | None,
 ) -> dict[str, Any]:
+    _ensure_glm_if_pending(analysis)
     if not analysis.glm_summary.get("available"):
         raise ValueError(analysis.glm_summary.get("error", "GLM 统计不可用"))
     condition_row = _glm_condition(analysis, condition)
@@ -3532,17 +4709,29 @@ def task_glm_payload(
 
 
 def task_glm_csv_bytes(analysis: AnalysisData) -> tuple[bytes, str]:
+    _ensure_glm_if_pending(analysis)
     if not analysis.glm_summary.get("available"):
         raise ValueError(analysis.glm_summary.get("error", "GLM 统计不可用"))
     output = io.StringIO(newline="")
     writer = csv.writer(output)
     analysis_info = analysis.summary["analysis"]
     recording_id = analysis.summary["recording"]["id"]
+    readiness = analysis.glm_summary.get("inference_readiness", {})
+    counts_by_value = {
+        item.get("value"): item for item in readiness.get("condition_counts", [])
+    }
     writer.writerow(
         [
             "analysis_id",
             "input_sha256",
             "recording_id",
+            "inference_state",
+            "inference_ready",
+            "minimum_trials_per_condition",
+            "effect_usable_trials_minimum",
+            "effect_total_trials_minimum",
+            "insufficient_conditions",
+            "inference_reason",
             "result_type",
             "channel_index",
             "channel",
@@ -3566,11 +4755,28 @@ def task_glm_csv_bytes(analysis: AnalysisData) -> tuple[bytes, str]:
     def write_effect(row: dict[str, Any], result_type: str) -> None:
         confidence = row["confidence_interval_95"]
         channel = row["channel"]
+        condition_values = (
+            [row.get("condition")]
+            if result_type == "condition"
+            else [row.get("left"), row.get("right")]
+        )
+        effect_counts = [
+            counts_by_value[value]
+            for value in condition_values
+            if value in counts_by_value
+        ]
         writer.writerow(
             [
                 analysis_info["id"],
                 analysis_info["input_sha256"],
                 recording_id,
+                readiness.get("state", "unavailable"),
+                bool(readiness.get("ready", False)),
+                readiness.get("minimum_trials_per_condition", 2),
+                min((item["usable_count"] for item in effect_counts), default=0),
+                min((item["total_count"] for item in effect_counts), default=0),
+                "; ".join(readiness.get("insufficient_conditions", [])),
+                readiness.get("reason", ""),
                 result_type,
                 channel["index"],
                 channel["label"],
@@ -3603,17 +4809,37 @@ def task_glm_csv_bytes(analysis: AnalysisData) -> tuple[bytes, str]:
 
 
 def _report_font():
-    """Prefer a bundled system CJK fallback so Chinese report labels remain readable."""
+    """Find a font that can render the complete bilingual report, not only CJK labels."""
+    from matplotlib import ft2font
     from matplotlib.font_manager import FontProperties
 
+    configured_font = os.getenv("FNIRS_REPORT_FONT", "").strip()
     candidates = (
-        "/usr/share/fonts/truetype/droid/DroidSansFallbackFull.ttf",
+        configured_font,
         "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
+        "/usr/share/fonts/opentype/noto/NotoSansCJKsc-Regular.otf",
+        "/usr/share/fonts/truetype/noto/NotoSansCJK-Regular.ttc",
+        "/mnt/c/Windows/Fonts/NotoSansSC-VF.ttf",
+        "/mnt/c/Windows/Fonts/msyh.ttc",
     )
+    required_glyphs = "分析报告 Cedalion fNIRS 0123456789 µM — ≥"
     for candidate in candidates:
-        if Path(candidate).is_file():
-            return FontProperties(fname=candidate)
-    return FontProperties()
+        if not candidate:
+            continue
+        path = Path(candidate).expanduser()
+        if not path.is_file():
+            continue
+        try:
+            face = ft2font.FT2Font(str(path))
+        except RuntimeError:
+            continue
+        if all(face.get_char_index(ord(character)) for character in required_glyphs):
+            return FontProperties(fname=path)
+
+    raise RuntimeError(
+        "无法找到同时支持中文、英文、数字和 µM 的 PDF 报告字体；"
+        "请安装 fonts-noto-cjk 或设置 FNIRS_REPORT_FONT。"
+    )
 
 
 def _report_value(value: Any, digits: int = 3) -> str:
@@ -3628,26 +4854,182 @@ def _report_value(value: Any, digits: int = 3) -> str:
     return f"{number:.{digits}g}"
 
 
-def _report_page(title: str, font: Any):
+def _report_page(title: str, font: Any, page_number: int):
     import matplotlib.pyplot as plt
+    from matplotlib.patches import Rectangle
 
-    figure = plt.figure(figsize=(8.27, 11.69))
-    figure.text(0.08, 0.95, title, fontsize=19, fontweight="bold", fontproperties=font)
+    figure = plt.figure(figsize=(8.27, 11.69), facecolor="#ffffff")
+    figure.add_artist(
+        Rectangle(
+            (0, 0.9),
+            1,
+            0.1,
+            transform=figure.transFigure,
+            facecolor="#17324d",
+            edgecolor="none",
+            zorder=0,
+        )
+    )
     figure.text(
-        0.08,
-        0.925,
-        "Cedalion fNIRS 分析报告",
-        fontsize=9,
-        color="#64748b",
+        0.07,
+        0.955,
+        "CEDALION fNIRS",
+        fontsize=8.5,
+        color="#b9d7ea",
+        fontproperties=font,
+    )
+    figure.text(
+        0.07,
+        0.922,
+        title,
+        fontsize=18,
+        fontweight="bold",
+        color="#ffffff",
+        fontproperties=font,
+    )
+    figure.add_artist(
+        Rectangle(
+            (0.07, 0.065),
+            0.86,
+            0.001,
+            transform=figure.transFigure,
+            facecolor="#d7e0e8",
+            edgecolor="none",
+        )
+    )
+    figure.text(
+        0.07,
+        0.038,
+        "单条记录分析报告 | 报告仅陈述处理事实，不替代研究者对实验假设和统计结论的解释。",
+        fontsize=7.6,
+        color="#5d6d7e",
+        fontproperties=font,
+    )
+    figure.text(
+        0.93,
+        0.038,
+        f"{page_number} / 3",
+        ha="right",
+        fontsize=7.6,
+        color="#5d6d7e",
         fontproperties=font,
     )
     return figure
 
 
+def _report_section(figure: Any, title: str, y: float, font: Any) -> None:
+    from matplotlib.patches import Rectangle
+
+    figure.text(0.07, y, title, fontsize=10.5, fontweight="bold", color="#17324d", fontproperties=font)
+    figure.add_artist(
+        Rectangle(
+            (0.07, y - 0.009),
+            0.035,
+            0.003,
+            transform=figure.transFigure,
+            facecolor="#2b7a9a",
+            edgecolor="none",
+        )
+    )
+
+
+def _report_card(
+    figure: Any,
+    x: float,
+    y: float,
+    width: float,
+    height: float,
+    label: str,
+    value: str,
+    detail: str,
+    font: Any,
+    *,
+    accent: str = "#2b7a9a",
+) -> None:
+    from matplotlib.patches import Rectangle
+
+    figure.add_artist(
+        Rectangle(
+            (x, y),
+            width,
+            height,
+            transform=figure.transFigure,
+            facecolor="#f5f8fa",
+            edgecolor="#d7e0e8",
+            linewidth=0.7,
+        )
+    )
+    figure.add_artist(
+        Rectangle(
+            (x, y),
+            0.009,
+            height,
+            transform=figure.transFigure,
+            facecolor=accent,
+            edgecolor="none",
+        )
+    )
+    figure.text(x + 0.024, y + height - 0.026, label, fontsize=8.2, color="#5d6d7e", fontproperties=font)
+    figure.text(x + 0.024, y + height - 0.06, value, fontsize=14, fontweight="bold", color="#17324d", fontproperties=font)
+    figure.text(x + 0.024, y + 0.018, detail, fontsize=7.6, color="#5d6d7e", fontproperties=font)
+
+
+def _report_detail_grid(
+    figure: Any,
+    items: list[tuple[str, str]],
+    y: float,
+    font: Any,
+    *,
+    columns: int = 2,
+    row_height: float = 0.053,
+) -> float:
+    """Lay out compact label/value rows and return the y coordinate below the grid."""
+    from matplotlib.patches import Rectangle
+
+    column_width = 0.86 / columns
+    for index, (label, value) in enumerate(items):
+        row = index // columns
+        column = index % columns
+        x = 0.07 + column * column_width
+        item_y = y - row * row_height
+        figure.add_artist(
+            Rectangle(
+                (x, item_y - 0.038),
+                column_width - 0.022,
+                0.001,
+                transform=figure.transFigure,
+                facecolor="#e3e9ee",
+                edgecolor="none",
+            )
+        )
+        figure.text(x, item_y, label, fontsize=7.8, color="#5d6d7e", fontproperties=font)
+        figure.text(x, item_y - 0.022, value, fontsize=9.2, color="#172b3a", fontproperties=font)
+    rows = math.ceil(len(items) / columns)
+    return y - rows * row_height
+
+
+def _report_percent(numerator: Any, denominator: Any) -> str:
+    try:
+        numerator_value = float(numerator)
+        denominator_value = float(denominator)
+    except (TypeError, ValueError):
+        return "—"
+    if denominator_value <= 0 or not math.isfinite(numerator_value) or not math.isfinite(denominator_value):
+        return "—"
+    return f"{numerator_value / denominator_value * 100:.0f}%"
+
+
+def _report_short_text(value: Any, limit: int = 92) -> str:
+    text = str(value or "—")
+    return text if len(text) <= limit else f"{text[: limit - 1]}…"
+
+
 def report_pdf_bytes(analysis: AnalysisData) -> tuple[bytes, str]:
     """Create a reproducible, single-record PDF without claiming scientific conclusions."""
+    _ensure_glm_if_pending(analysis)
     from matplotlib.backends.backend_pdf import PdfPages
     import matplotlib.pyplot as plt
+    from matplotlib.patches import Rectangle
 
     font = _report_font()
     summary = analysis.summary
@@ -3655,94 +5037,422 @@ def report_pdf_bytes(analysis: AnalysisData) -> tuple[bytes, str]:
     quality = analysis.quality_summary
     task = analysis.task_summary
     motion_summary = analysis.motion_summary
+    total_channels = quality.get("total_channels", 0)
+    passed_channels = quality.get("passed_channels", 0)
+    motion_total = motion_summary.get("total_samples", 0)
+    motion_flagged = motion_summary.get("flagged_samples", 0)
+    filter_label = "低通滤波" if analysis.config.filter_min_hz == 0 else "带通滤波"
+    filter_range = (
+        f"{analysis.config.filter_max_hz:g} Hz"
+        if analysis.config.filter_min_hz == 0
+        else f"{analysis.config.filter_min_hz:g}–{analysis.config.filter_max_hz:g} Hz"
+    )
+    input_hash = str(analysis_info.get("input_sha256") or "—")
+    input_hash_display = (
+        f"{input_hash[:24]}…{input_hash[-16:]}" if len(input_hash) > 44 else input_hash
+    )
     output = io.BytesIO()
     with PdfPages(output) as pdf:
-        # Page 1: metadata and QC facts.
-        figure = _report_page("分析概况与数据质量", font)
-        lines = [
-            f"记录文件：{summary['filename']}",
-            f"受试者：{(summary.get('subject') or {}).get('display_name') or '未提供'}",
-            f"分析 ID：{analysis_info['id']}",
-            f"输入 SHA-256：{analysis_info['input_sha256']}",
-            f"分析时间：{analysis_info['created_at_utc']}",
-            f"Cedalion：{summary['cedalion_version']}    Python：{platform.python_version()}",
-            "",
-            f"采样率：{_report_value(summary.get('sample_rate_hz'))} Hz    记录时长：{_report_value(summary.get('duration_seconds') / 60, 4)} min",
-            f"波长：{' / '.join(str(value) for value in summary.get('wavelengths_nm', []))} nm    DPF：{_report_value(summary.get('dpf'))}",
-            f"原始通道：{summary.get('raw_channels', '—')}    分析通道：{summary.get('analyzed_channels', '—')}",
-            f"质量通过：{quality.get('passed_channels', 0)} / {quality.get('total_channels', 0)}",
-            f"质量门限：SNR ≥ {_report_value(quality.get('snr_threshold'))}；SCI ≥ {_report_value(quality.get('sci_threshold'))}；PSP 合格窗口 ≥ {_report_value(quality.get('psp_min_clean_fraction') * 100, 3)}%",
-            f"GVTD 异常候选：{motion_summary.get('flagged_samples', 0)} / {motion_summary.get('total_samples', 0)} 个采样点",
-            f"人工排除通道：{len(summary.get('manual_quality_control', {}).get('bad_channel_labels', []))} 个",
-            "",
-            "本页仅汇总分析事实，不替代研究者对实验假设和统计结论的解释。",
-        ]
-        figure.text(0.1, 0.88, "\n".join(lines), va="top", fontsize=10.5, linespacing=1.65, fontproperties=font)
-        figure.text(0.1, 0.09, "处理流程：SNIRF → 光密度 → HbO/HbR → 质量筛选 → 任务平均 / GLM", fontsize=9, color="#475569", fontproperties=font)
+        # Page 1: recording identity and quality facts.
+        figure = _report_page("分析概况与数据质量", font, 1)
+        _report_section(figure, "记录与分析身份", 0.86, font)
+        figure.text(0.07, 0.825, "记录文件", fontsize=7.8, color="#5d6d7e", fontproperties=font)
+        figure.text(
+            0.07,
+            0.802,
+            _report_short_text(summary.get("filename"), 105),
+            fontsize=9.4,
+            color="#172b3a",
+            fontproperties=font,
+        )
+        figure.add_artist(
+            Rectangle(
+                (0.07, 0.785),
+                0.86,
+                0.001,
+                transform=figure.transFigure,
+                facecolor="#e3e9ee",
+                edgecolor="none",
+            )
+        )
+        _report_detail_grid(
+            figure,
+            [
+                ("受试者", str((summary.get("subject") or {}).get("display_name") or "未提供")),
+                ("分析时间 (UTC)", str(analysis_info.get("created_at_utc") or "—")),
+                ("分析 ID", str(analysis_info.get("id") or "—")),
+                ("输入 SHA-256", input_hash_display),
+                (
+                    "运行环境",
+                    f"Cedalion {summary.get('cedalion_version', '—')} | Python {platform.python_version()}",
+                ),
+                (
+                    "采样与记录",
+                    f"{_report_value(summary.get('sample_rate_hz'))} Hz | "
+                    f"{_report_value((summary.get('duration_seconds') or 0) / 60, 4)} min",
+                ),
+            ],
+            0.75,
+            font,
+        )
+
+        _report_section(figure, "质量摘要", 0.565, font)
+        cards = (
+            (
+                "质量通过",
+                f"{passed_channels} / {total_channels}",
+                f"通过率 {_report_percent(passed_channels, total_channels)}",
+                "#24755a",
+            ),
+            (
+                "SNR 门限",
+                f"≥ {_report_value(quality.get('snr_threshold'))}",
+                "使用所有波长的最低值",
+                "#2b7a9a",
+            ),
+            (
+                "SCI 门限",
+                f"≥ {_report_value(quality.get('sci_threshold'))}",
+                "通道平均值",
+                "#2b7a9a",
+            ),
+            (
+                "PSP 合格窗口",
+                f"≥ {_report_value((quality.get('psp_min_clean_fraction') or 0) * 100, 3)}%",
+                "质量判定必需条件",
+                "#2b7a9a",
+            ),
+        )
+        for index, (label, value, detail, accent) in enumerate(cards):
+            _report_card(
+                figure,
+                0.07 + index * 0.218,
+                0.415,
+                0.202,
+                0.115,
+                label,
+                value,
+                detail,
+                font,
+                accent=accent,
+            )
+        figure.text(
+            0.07,
+            0.365,
+            f"GVTD 异常候选：{motion_flagged} / {motion_total} 个采样点 "
+            f"({_report_percent(motion_flagged, motion_total)})",
+            fontsize=8.8,
+            color="#172b3a",
+            fontproperties=font,
+        )
+        figure.text(
+            0.07,
+            0.337,
+            f"人工排除：{len(summary.get('manual_quality_control', {}).get('bad_channel_labels', []))} 个通道"
+            f"    原始 / 分析通道：{summary.get('raw_channels', '—')} / {summary.get('analyzed_channels', '—')}",
+            fontsize=8.8,
+            color="#172b3a",
+            fontproperties=font,
+        )
+
+        _report_section(figure, "处理流程", 0.275, font)
+        figure.text(
+            0.07,
+            0.235,
+            "SNIRF 读取  →  光密度  →  HbO/HbR  →  质量筛选  →  任务平均 / GLM",
+            fontsize=10.2,
+            color="#17324d",
+            fontproperties=font,
+        )
+        figure.text(
+            0.07,
+            0.19,
+            "波长："
+            + (" / ".join(str(value) for value in summary.get("wavelengths_nm", [])) or "—")
+            + f" nm    DPF：{_report_value(summary.get('dpf'))}    "
+            + f"任务运动校正：{task.get('motion_correction', '—')}",
+            fontsize=8.8,
+            color="#5d6d7e",
+            fontproperties=font,
+        )
         pdf.savefig(figure, bbox_inches="tight")
         plt.close(figure)
 
         # Page 2: representative task-locked response, when available.
-        figure = _report_page("任务响应结果", font)
+        figure = _report_page("任务锁定响应", font, 2)
         try:
-            condition = (task.get("conditions") or [])[0]["value"]
+            condition_row = (task.get("conditions") or [])[0]
+            condition = condition_row["value"]
+            has_repeated_trials = int(condition_row.get("count", 0)) >= 2
             _, channel, time, arrays = _task_arrays(analysis, condition, 0)
-            axis = figure.add_axes((0.12, 0.45, 0.78, 0.38))
+            _report_section(figure, "代表性任务响应", 0.86, font)
+            _report_card(
+                figure,
+                0.07,
+                0.715,
+                0.268,
+                0.115,
+                "条件",
+                _report_short_text(condition, 26),
+                f"纳入试次 {condition_row.get('count', '—')}",
+                font,
+            )
+            _report_card(
+                figure,
+                0.366,
+                0.715,
+                0.268,
+                0.115,
+                "代表通道",
+                str(channel["label"]),
+                "第一个质量合格通道",
+                font,
+            )
+            _report_card(
+                figure,
+                0.662,
+                0.715,
+                0.268,
+                0.115,
+                "任务窗口",
+                f"−{analysis.config.epoch_before_seconds:g} 至 +{analysis.config.epoch_after_seconds:g} s",
+                f"刺激时长 {float(task.get('stimulus_duration_seconds') or 0):g} s",
+                font,
+            )
+            axis = figure.add_axes((0.12, 0.36, 0.78, 0.34))
+            axis.set_facecolor("#f7fafc")
             axis.plot(time, arrays["HbO"], color="#d95f59", label="HbO")
-            axis.fill_between(time, arrays["HbO"] - arrays["HbO_sem"], arrays["HbO"] + arrays["HbO_sem"], color="#d95f59", alpha=0.16)
+            axis.fill_between(
+                time,
+                arrays["HbO"] - arrays["HbO_sem"],
+                arrays["HbO"] + arrays["HbO_sem"],
+                color="#d95f59",
+                alpha=0.16,
+            )
             axis.plot(time, arrays["HbR"], color="#3978b8", label="HbR")
-            axis.fill_between(time, arrays["HbR"] - arrays["HbR_sem"], arrays["HbR"] + arrays["HbR_sem"], color="#3978b8", alpha=0.14)
-            axis.axvspan(0, float(task.get("stimulus_duration_seconds", 0)), color="#94a3b8", alpha=0.14)
+            axis.fill_between(
+                time,
+                arrays["HbR"] - arrays["HbR_sem"],
+                arrays["HbR"] + arrays["HbR_sem"],
+                color="#3978b8",
+                alpha=0.14,
+            )
+            axis.axvspan(
+                0,
+                float(task.get("stimulus_duration_seconds") or 0),
+                color="#9db5c7",
+                alpha=0.2,
+                label="刺激区间",
+            )
             axis.axvline(0, color="#64748b", linewidth=0.8)
             axis.set_xlabel("相对刺激时间 (s)", fontproperties=font)
             axis.set_ylabel("浓度变化 (µM)", fontproperties=font)
-            condition_count = next((item.get("count") for item in task.get("conditions", []) if item.get("value") == condition), "—")
-            axis.set_title(f"条件：{condition}    通道：{channel['label']}    试次数：{condition_count}", fontproperties=font)
-            axis.legend(prop=font)
-            axis.grid(alpha=0.2)
+            axis.legend(prop=font, loc="upper left", frameon=True, framealpha=0.94)
+            axis.grid(alpha=0.18, color="#6c7f90")
             for label in axis.get_xticklabels() + axis.get_yticklabels():
                 label.set_fontproperties(font)
             metrics = task_response_payload(analysis, condition, 0, 2000)["metrics"]
-            metric_lines = [
-                f"HbO 峰值：{_report_value(metrics['hbo_peak']['amplitude'])} µM，潜伏期：{_report_value(metrics['hbo_peak']['latency_seconds'])} s",
-                f"HbR 谷值：{_report_value(metrics['hbr_trough']['amplitude'])} µM，潜伏期：{_report_value(metrics['hbr_trough']['latency_seconds'])} s",
-                f"分段：刺激前 {analysis.config.epoch_before_seconds:g} s 至刺激后 {analysis.config.epoch_after_seconds:g} s；基线：刺激前 {analysis.config.epoch_before_seconds:g} s",
-            ]
-            figure.text(0.12, 0.32, "\n".join(metric_lines), fontsize=10, fontproperties=font, linespacing=1.7)
-            figure.text(0.12, 0.23, "图中阴影表示 SEM；默认代表第一个条件和第一个质量合格通道。完整通道结果请使用 CSV 导出。", fontsize=8.5, color="#475569", fontproperties=font)
+            _report_card(
+                figure,
+                0.07,
+                0.175,
+                0.268,
+                0.115,
+                "HbO 峰值",
+                f"{_report_value(metrics['hbo_peak']['amplitude'])} µM",
+                f"潜伏期 {_report_value(metrics['hbo_peak']['latency_seconds'])} s",
+                font,
+                accent="#d95f59",
+            )
+            _report_card(
+                figure,
+                0.366,
+                0.175,
+                0.268,
+                0.115,
+                "HbR 谷值",
+                f"{_report_value(metrics['hbr_trough']['amplitude'])} µM",
+                f"潜伏期 {_report_value(metrics['hbr_trough']['latency_seconds'])} s",
+                font,
+                accent="#3978b8",
+            )
+            _report_card(
+                figure,
+                0.662,
+                0.175,
+                0.268,
+                0.115,
+                "计算说明",
+                "均值 ± SEM" if has_repeated_trials else "单次响应",
+                f"响应窗 {analysis.config.response_start_seconds:g}–{analysis.config.response_end_seconds:g} s",
+                font,
+            )
+            figure.text(
+                0.07,
+                0.11,
+                (
+                    "阴影表示 SEM；本图默认选择第一个条件和第一个质量合格通道。完整逐通道结果请使用 CSV 导出。"
+                    if has_repeated_trials
+                    else "该条件只有一个可用试次，不提供 SEM；曲线仅作描述性查看。完整结果请使用 CSV 导出。"
+                ),
+                fontsize=8.1,
+                color="#5d6d7e",
+                fontproperties=font,
+            )
         except (IndexError, KeyError, TypeError, ValueError) as exc:
-            figure.text(0.1, 0.84, f"任务响应不可用：{exc}", fontsize=11, fontproperties=font)
+            _report_section(figure, "任务响应不可用", 0.86, font)
+            figure.add_artist(
+                Rectangle(
+                    (0.07, 0.6),
+                    0.86,
+                    0.17,
+                    transform=figure.transFigure,
+                    facecolor="#fff7ed",
+                    edgecolor="#f4c48b",
+                    linewidth=0.8,
+                )
+            )
+            figure.text(0.095, 0.708, "当前记录未生成可报告的任务锁定响应。", fontsize=11, color="#9a4b12", fontproperties=font)
+            figure.text(0.095, 0.665, _report_short_text(exc, 135), fontsize=8.6, color="#5d6d7e", fontproperties=font)
         pdf.savefig(figure, bbox_inches="tight")
         plt.close(figure)
 
-        # Page 3: GLM and all analysis settings.
-        figure = _report_page("GLM 统计与分析参数", font)
+        # Page 3: GLM and full analysis settings.
+        figure = _report_page("统计模型与分析参数", font, 3)
         glm_summary = analysis.glm_summary
-        glm_lines = [
-            f"GLM 状态：{'可用' if glm_summary.get('available') else '不可用'}",
-            f"模型：{glm_summary.get('model', {}).get('noise_model', '—')}；HRF：Gamma",
-            f"建模通道：{len(glm_summary.get('channel_labels', []))} 个；条件：{len(glm_summary.get('conditions', []))} 个",
+        readiness = glm_summary.get("inference_readiness", {})
+        readiness_state = readiness.get(
+            "state",
+            "ready" if glm_summary.get("available") else "unavailable",
+        )
+        glm_status = {
+            "ready": "重复试次就绪",
+            "exploratory": "仅探索性",
+            "unavailable": "不可用",
+        }.get(readiness_state, "不可用")
+        significant = [
+            row
+            for row in analysis.glm_condition_effects
+            if row.get("q_value") is not None and row["q_value"] < 0.05
         ]
-        if not glm_summary.get("available"):
-            glm_lines.append(f"原因：{glm_summary.get('error', '未建立 GLM')}")
-        else:
-            significant = [row for row in analysis.glm_condition_effects if row.get("q_value") is not None and row["q_value"] < 0.05]
-            glm_lines.append(f"FDR q < 0.05 的条件效应：{len(significant)} 项")
-        figure.text(0.1, 0.87, "\n".join(glm_lines), va="top", fontsize=10.5, fontproperties=font, linespacing=1.7)
-        parameter_lines = [
-            f"滤波：{analysis.config.filter_min_hz:g}–{analysis.config.filter_max_hz:g} Hz",
-            f"TDDR：任务分析启用；CBSI：{analysis.config.cbsi_mode}",
-            f"GVTD：{analysis.config.gvtd_mode}；短距离通道：{analysis.config.short_separation_mode}",
-            f"短距离阈值：{analysis.config.short_separation_mm:g} mm；GLM 短距离回归：{analysis.config.glm_short_separation_mode}",
-            f"GLM 漂移截止：{analysis.config.glm_drift_cutoff_hz:g} Hz；HRF sigma：{analysis.config.glm_hrf_sigma_seconds:g} s",
-            f"GLM 生理回归：{analysis.config.glm_nuisance_mode}",
-            "",
-            "研究者备注：____________________________________________",
-            "________________________________________________________",
-            "________________________________________________________",
-        ]
-        figure.text(0.1, 0.56, "分析参数与备注\n" + "\n".join(parameter_lines), va="top", fontsize=10, fontproperties=font, linespacing=1.7)
-        figure.text(0.1, 0.09, "报告由当前缓存分析生成；如修改质量决定或分析设置，请重新生成报告并保留新的分析 ID。", fontsize=8.5, color="#475569", fontproperties=font)
+        _report_section(figure, "GLM 统计状态", 0.86, font)
+        _report_card(
+            figure,
+            0.07,
+            0.715,
+            0.268,
+            0.115,
+            "GLM 状态",
+            glm_status,
+            "计算可用" if glm_summary.get("available") else "未生成模型结果",
+            font,
+            accent="#24755a" if readiness_state == "ready" else "#b45309",
+        )
+        _report_card(
+            figure,
+            0.366,
+            0.715,
+            0.268,
+            0.115,
+            "模型",
+            str(glm_summary.get("model", {}).get("noise_model", "—")).upper(),
+            "Gamma HRF",
+            font,
+        )
+        _report_card(
+            figure,
+            0.662,
+            0.715,
+            0.268,
+            0.115,
+            "FDR q < 0.05" if readiness_state == "ready" else "FDR 结果",
+            (
+                f"{len(significant)} 项"
+                if readiness_state == "ready"
+                else "仅供探索"
+                if readiness_state == "exploratory"
+                else "—"
+            ),
+            (
+                f"建模通道 {len(glm_summary.get('channel_labels', []))} 个"
+                if readiness_state == "ready"
+                else "不汇总为正式显著项"
+            ),
+            font,
+        )
+        if readiness_state != "ready":
+            figure.text(
+                0.07,
+                0.7,
+                _report_short_text(
+                    readiness.get("reason")
+                    or f"未建立 GLM 的原因：{glm_summary.get('error', '未提供原因')}",
+                    115,
+                ),
+                fontsize=8.6,
+                color="#9a4b12",
+                fontproperties=font,
+            )
+
+        _report_section(figure, "分析参数", 0.65, font)
+        _report_detail_grid(
+            figure,
+            [
+                (filter_label, filter_range),
+                ("运动校正", f"TDDR；CBSI {analysis.config.cbsi_mode}"),
+                (
+                    "任务分段",
+                    f"−{analysis.config.epoch_before_seconds:g} 至 +{analysis.config.epoch_after_seconds:g} s",
+                ),
+                (
+                    "响应窗口",
+                    f"{analysis.config.response_start_seconds:g}–{analysis.config.response_end_seconds:g} s",
+                ),
+                ("GVTD 策略", str(analysis.config.gvtd_mode)),
+                (
+                    "短距离通道",
+                    f"{analysis.config.short_separation_mode} | {analysis.config.short_separation_mm:g} mm",
+                ),
+                ("GLM 短距离回归", str(analysis.config.glm_short_separation_mode)),
+                ("GLM 生理回归", str(analysis.config.glm_nuisance_mode)),
+                ("GLM 漂移截止", f"{analysis.config.glm_drift_cutoff_hz:g} Hz"),
+                ("HRF sigma / AR 阶数", f"{analysis.config.glm_hrf_sigma_seconds:g} s / {analysis.config.glm_ar_order}"),
+            ],
+            0.615,
+            font,
+        )
+
+        _report_section(figure, "研究者备注", 0.315, font)
+        figure.add_artist(
+            Rectangle(
+                (0.07, 0.115),
+                0.86,
+                0.165,
+                transform=figure.transFigure,
+                facecolor="#fbfcfd",
+                edgecolor="#d7e0e8",
+                linewidth=0.7,
+            )
+        )
+        for y in (0.235, 0.195, 0.155):
+            figure.add_artist(
+                Rectangle(
+                    (0.09, y),
+                    0.82,
+                    0.001,
+                    transform=figure.transFigure,
+                    facecolor="#d7e0e8",
+                    edgecolor="none",
+                )
+            )
+        figure.text(
+            0.07,
+            0.09,
+            "如修改质量决定或分析设置，请重新生成报告并保留新的分析 ID。",
+            fontsize=8.1,
+            color="#5d6d7e",
+            fontproperties=font,
+        )
         pdf.savefig(figure, bbox_inches="tight")
         plt.close(figure)
 
@@ -3753,6 +5463,8 @@ def report_pdf_bytes(analysis: AnalysisData) -> tuple[bytes, str]:
 class DashboardHandler(SimpleHTTPRequestHandler):
     data_dir: Path
     default_data_file: Path
+    upload_dir: Path
+    max_upload_bytes: int
     analysis_config: AnalysisConfig
     environment_config: AnalysisConfig
     analysis_config_source: str
@@ -3796,16 +5508,88 @@ class DashboardHandler(SimpleHTTPRequestHandler):
             raise ValueError("请求体必须是 JSON 对象")
         return payload
 
+    def _store_uploaded_recording(self) -> dict[str, Any]:
+        raw_length = self.headers.get("Content-Length")
+        try:
+            length = int(raw_length or "0")
+        except ValueError as exc:
+            raise ValueError("Content-Length 无效") from exc
+        if length <= 0:
+            raise ValueError("上传文件不能为空")
+        if length > self.max_upload_bytes:
+            raise UploadTooLargeError(
+                f"上传文件不能超过 {self.max_upload_bytes // 1024 // 1024} MiB"
+            )
+
+        filename = _upload_filename(self.headers.get("X-FNIRS-Filename"))
+        self.upload_dir.mkdir(parents=True, exist_ok=True)
+        destination = self.upload_dir / filename
+        temporary_path: Path | None = None
+        try:
+            with tempfile.NamedTemporaryFile(
+                mode="wb",
+                prefix=".upload-",
+                suffix=".tmp",
+                dir=self.upload_dir,
+                delete=False,
+            ) as temporary:
+                temporary_path = Path(temporary.name)
+                remaining = length
+                while remaining:
+                    chunk = self.rfile.read(min(HASH_CHUNK_BYTES, remaining))
+                    if not chunk:
+                        raise ValueError("上传内容不完整")
+                    temporary.write(chunk)
+                    remaining -= len(chunk)
+                temporary.flush()
+                os.fsync(temporary.fileno())
+
+            if not h5py.is_hdf5(temporary_path):
+                raise ValueError("上传文件不是有效的 HDF5/SNIRF 文件")
+            # link() fails if the destination appeared after validation, so an
+            # upload can never overwrite an existing user recording.
+            os.link(temporary_path, destination)
+            temporary_path.unlink()
+            temporary_path = None
+        finally:
+            if temporary_path is not None:
+                temporary_path.unlink(missing_ok=True)
+
+        return _recording_descriptor(
+            destination,
+            self.data_dir,
+            self.default_data_file,
+            self.upload_dir,
+        )
+
+    def _delete_uploaded_recording(self, requested_id: str | None) -> str:
+        if requested_id is None:
+            raise ValueError("recording 参数不能为空")
+        path, recording_id = resolve_recording(
+            self.data_dir,
+            self.default_data_file,
+            requested_id,
+        )
+        if not _is_within_directory(path, self.upload_dir):
+            raise PermissionError("只能删除已上传的文件")
+        path.unlink()
+        self.qc_decision_store.update(recording_id, [])
+        _file_sha256.cache_clear()
+        _load_analysis_cached.cache_clear()
+        return recording_id
+
     def _load_selected_analysis(
         self,
         data_file: Path,
         recording_id: str,
+        include_glm: bool = True,
     ) -> AnalysisData:
         return load_analysis(
             data_file,
             self.analysis_config,
             recording_id,
             self.qc_decision_store.for_recording(recording_id),
+            include_glm=include_glm,
         )
 
     @classmethod
@@ -3872,6 +5656,7 @@ class DashboardHandler(SimpleHTTPRequestHandler):
                         "recordings": list_recordings(
                             self.data_dir,
                             self.default_data_file,
+                            self.upload_dir,
                             subject=subject or None,
                             session=session or None,
                         ),
@@ -3905,7 +5690,18 @@ class DashboardHandler(SimpleHTTPRequestHandler):
                 config, source = self._current_config()
                 return self._json(analysis_config_payload(config, source))
 
-            analysis = self._load_selected_analysis(data_file, recording_id)
+            glm_required_paths = {
+                "/api/report-pdf",
+                "/api/analysis-metadata",
+                "/api/analysis-metadata-export",
+                "/api/task-glm",
+                "/api/task-glm-export",
+            }
+            analysis = self._load_selected_analysis(
+                data_file,
+                recording_id,
+                include_glm=parsed.path in glm_required_paths,
+            )
             if parsed.path == "/api/report-pdf":
                 body, filename = report_pdf_bytes(analysis)
                 return self._bytes(body, "application/pdf", filename)
@@ -4011,7 +5807,8 @@ class DashboardHandler(SimpleHTTPRequestHandler):
                 return self._bytes(body, "text/csv; charset=utf-8", filename)
             if parsed.path == "/api/task-glm":
                 condition = query.get("condition", [None])[0]
-                channel_index = int(query.get("channel", ["0"])[0])
+                channel_value = query.get("channel", ["0"])[0]
+                channel_index = -1 if channel_value == "auto" else int(channel_value)
                 contrast = query.get("contrast", [None])[0]
                 return self._json(
                     {
@@ -4042,6 +5839,17 @@ class DashboardHandler(SimpleHTTPRequestHandler):
 
     def do_POST(self) -> None:  # noqa: N802
         parsed = urlparse(self.path)
+        if parsed.path == "/api/uploads":
+            try:
+                recording = self._store_uploaded_recording()
+                self._json({"ok": True, "recording": recording}, HTTPStatus.CREATED)
+            except UploadTooLargeError as exc:
+                self._error_json(HTTPStatus.REQUEST_ENTITY_TOO_LARGE, str(exc))
+            except FileExistsError:
+                self._error_json(HTTPStatus.CONFLICT, "同名上传文件已存在")
+            except (OSError, ValueError) as exc:
+                self._error_json(HTTPStatus.BAD_REQUEST, f"上传失败：{exc}")
+            return
         if parsed.path == "/api/settings":
             try:
                 payload = self._request_json()
@@ -4112,11 +5920,31 @@ class DashboardHandler(SimpleHTTPRequestHandler):
             self.log_error("QC decision error: %s", exc)
             self._error_json(HTTPStatus.INTERNAL_SERVER_ERROR, f"质量决定更新失败：{exc}")
 
+    def do_DELETE(self) -> None:  # noqa: N802
+        parsed = urlparse(self.path)
+        if parsed.path != "/api/uploads":
+            self._error_json(HTTPStatus.NOT_FOUND, "接口不存在")
+            return
+        try:
+            query = parse_qs(parsed.query, keep_blank_values=True)
+            requested_recording_id = self._single_query_value(
+                query,
+                RECORDING_QUERY_PARAMETER,
+            )
+            recording_id = self._delete_uploaded_recording(requested_recording_id)
+            self._json({"ok": True, "deleted_recording": recording_id})
+        except FileNotFoundError:
+            self._error_json(HTTPStatus.NOT_FOUND, "找不到上传文件")
+        except PermissionError as exc:
+            self._error_json(HTTPStatus.FORBIDDEN, str(exc))
+        except (OSError, ValueError) as exc:
+            self._error_json(HTTPStatus.BAD_REQUEST, f"删除失败：{exc}")
+
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Serve the Cedalion fNIRS dashboard")
     parser.add_argument("--host", default=os.getenv("FNIRS_HOST", "0.0.0.0"))
-    parser.add_argument("--port", type=int, default=int(os.getenv("FNIRS_PORT", "8080")))
+    parser.add_argument("--port", type=int, default=int(os.getenv("FNIRS_PORT", "10000")))
     return parser.parse_args()
 
 
@@ -4140,8 +5968,30 @@ def main() -> None:
     if data_file == data_dir:
         raise SystemExit("FNIRS_DEFAULT_FILE 必须是 FNIRS_DATA_DIR 内的文件")
 
+    upload_directory = os.getenv("FNIRS_UPLOAD_DIR", DEFAULT_UPLOAD_DIRECTORY)
+    if not upload_directory or "\x00" in upload_directory or Path(upload_directory).is_absolute():
+        raise SystemExit("FNIRS_UPLOAD_DIR 必须是 FNIRS_DATA_DIR 内的相对目录")
+    upload_dir = (data_dir / upload_directory).resolve()
+    try:
+        _recording_id(upload_dir, data_dir)
+    except ValueError as exc:
+        raise SystemExit("FNIRS_UPLOAD_DIR 必须位于 FNIRS_DATA_DIR 内") from exc
+    if upload_dir == data_dir:
+        raise SystemExit("FNIRS_UPLOAD_DIR 不能是 FNIRS_DATA_DIR 本身")
+    try:
+        max_upload_bytes = _environment_int(
+            "FNIRS_MAX_UPLOAD_BYTES",
+            DEFAULT_MAX_UPLOAD_BYTES,
+        )
+    except ValueError as exc:
+        raise SystemExit(f"上传配置错误：{exc}") from exc
+    if max_upload_bytes <= 0:
+        raise SystemExit("FNIRS_MAX_UPLOAD_BYTES 必须大于 0")
+
     DashboardHandler.data_dir = data_dir
     DashboardHandler.default_data_file = data_file
+    DashboardHandler.upload_dir = upload_dir
+    DashboardHandler.max_upload_bytes = max_upload_bytes
     DashboardHandler.environment_config = analysis_config
     settings_filename = Path(
         os.getenv("FNIRS_ANALYSIS_SETTINGS_FILE", data_dir / ".fnirs-dashboard-settings.json")
@@ -4162,6 +6012,7 @@ def main() -> None:
     server = ThreadingHTTPServer((args.host, args.port), DashboardHandler)
     print(f"Cedalion dashboard: http://{args.host}:{args.port}")
     print(f"SNIRF data directory: {data_dir}")
+    print(f"SNIRF upload directory: {upload_dir}")
     print(f"Default SNIRF data file: {data_file}")
     try:
         server.serve_forever()

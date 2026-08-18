@@ -19,7 +19,8 @@
       </section>
       <section class="panel glm-panel standalone" aria-labelledby="glm-title">
         <header class="panel-header task-header"><div><p class="eyebrow">MODEL-BASED INFERENCE</p><h2 id="glm-title">GLM 统计推断</h2><p id="glm-subtitle" class="panel-subtitle">与上方所选条件和通道对应的 HRF 回归结果</p></div><div class="task-actions"><button id="glm-export" class="button button-secondary" type="button" disabled>导出 GLM CSV</button></div></header>
-        <div class="glm-toolbar"><label class="compact-field"><span>条件对比</span><select id="glm-contrast" disabled><option>等待 GLM</option></select></label><div id="glm-method" class="method-note">正在构建设计矩阵…</div></div>
+        <div class="glm-toolbar"><label class="compact-field"><span>条件对比</span><select id="glm-contrast" disabled><option>等待 GLM</option></select></label><span id="glm-readiness-badge" class="badge badge-neutral" role="status">等待推断就绪度</span><div id="glm-method" class="method-note">正在构建设计矩阵…</div></div>
+        <p id="glm-inference-note" class="glm-message">正在检查重复试次和推断就绪度…</p>
         <div class="glm-result-grid">
           <section class="glm-result-section" aria-labelledby="glm-condition-title"><h3 id="glm-condition-title">条件效应</h3><div class="table-wrap"><table><thead><tr><th>成分</th><th>Beta</th><th>95% CI</th><th>t</th><th>p</th><th>q (FDR)</th><th>R²</th></tr></thead><tbody id="glm-condition-body"><tr><td colspan="7" class="empty-cell">等待 GLM 结果</td></tr></tbody></table></div></section>
           <section class="glm-result-section" aria-labelledby="glm-contrast-title"><h3 id="glm-contrast-title">条件对比</h3><div class="table-wrap"><table><thead><tr><th>成分</th><th>效应差</th><th>95% CI</th><th>t</th><th>p</th><th>q (FDR)</th><th>R²</th></tr></thead><tbody id="glm-contrast-body"><tr><td colspan="7" class="empty-cell">选择两个以上条件后显示</td></tr></tbody></table></div></section>
@@ -28,6 +29,6 @@
       </section>
       <footer class="page-footer"><span>峰值和潜伏期在刺激后 3–15 秒响应窗内计算。</span><span id="updated-at">尚未更新</span></footer>
     </main>
-    <script src="/common.js?v=nuisance-1" defer></script><script src="/task.js?v=nuisance-1" defer></script>
+    <script src="/common.js?v=nuisance-1" defer></script><script src="/task.js?v=guardrails-1" defer></script>
   </body>
 </html>

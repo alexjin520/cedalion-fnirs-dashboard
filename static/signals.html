@@ -43,6 +43,7 @@
           <header class="panel-header inspector-header"><div><p class="eyebrow">CHANNEL INSPECTOR</p><h2 id="inspector-title">通道检查器</h2></div><span id="channel-status" class="badge badge-neutral">等待分析</span></header>
           <label class="field"><span>当前通道</span><select id="channel-select" disabled><option>等待分析</option></select></label>
           <div class="optode-map" aria-label="光源探测器关系"><div><span>光源</span><strong id="source-name">—</strong></div><i><span></span></i><div><span>探测器</span><strong id="detector-name">—</strong></div></div>
+          <div class="channel-distance"><span>通道距离</span><strong id="channel-distance">—</strong></div>
           <section class="quality-readings" aria-label="当前通道质量">
             <div class="reading"><div><span>平均 / 最低 SNR</span><strong id="channel-snr">—</strong></div><div class="meter"><i id="snr-meter"></i></div><small>阈值：最低 SNR ≥ 2</small></div>
             <div class="reading"><div><span>平均 SCI</span><strong id="channel-sci">—</strong></div><div class="meter"><i id="sci-meter"></i></div><small>阈值：SCI ≥ 0.7</small></div>
@@ -55,6 +56,6 @@
       <section class="page-tip"><span class="status-dot"></span><p><strong>任务与运动候选区段已标在曲线上。</strong> 橙色表示任务区间，红色表示 GVTD 自动标出的异常候选；CBSI 基于 HbO/HbR 负相关假设，Wavelet 是实验比较选项。</p><a href="/task.html">转到任务响应 →</a></section>
       <footer class="page-footer"><span>显示数据会按视图宽度降采样，统计值基于完整数据。</span><span id="updated-at">尚未更新</span></footer>
     </main>
-    <script src="/common.js?v=records-1" defer></script><script src="/signals.js?v=canvas-light-1" defer></script>
+    <script src="/common.js?v=records-1" defer></script><script src="/signals.js?v=channel-distance-1" defer></script>
   </body>
 </html>

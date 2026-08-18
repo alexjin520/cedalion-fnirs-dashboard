@@ -5,7 +5,7 @@ APP_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 RUNTIME_DIR="$APP_DIR/.runtime"
 PID_FILE="$RUNTIME_DIR/server.pid"
 LOG_FILE="$RUNTIME_DIR/server.log"
-SERVER_PORT="${FNIRS_PORT:-8080}"
+SERVER_PORT="${FNIRS_PORT:-10000}"
 
 init_command="$(tr '\0' ' ' < /proc/1/cmdline 2>/dev/null || true)"
 if [[ "$init_command" == *"bwrap"* && "$init_command" == *"--die-with-parent"* ]]; then

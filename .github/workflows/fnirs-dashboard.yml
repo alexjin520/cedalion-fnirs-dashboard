@@ -1,0 +1,58 @@
+name: fNIRS dashboard checks
+
+on:
+  push:
+    paths:
+      - "fnirs-dashboard/**"
+      - ".github/workflows/fnirs-dashboard.yml"
+  pull_request:
+    paths:
+      - "fnirs-dashboard/**"
+      - ".github/workflows/fnirs-dashboard.yml"
+  workflow_dispatch:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: fnirs-dashboard
+    steps:
+      - name: Check out dashboard
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+          cache-dependency-path: fnirs-dashboard/requirements-cedalion.txt
+
+      - name: Install runtime dependencies
+        run: python -m pip install --upgrade pip && python -m pip install -r requirements.txt
+
+      - name: Install pinned Cedalion
+        run: |
+          git clone --depth 1 --branch v26.5.1 https://github.com/ibs-lab/cedalion.git .vendor/cedalion
+          python -m pip install --no-deps .vendor/cedalion
+
+      - name: Compile Python sources
+        run: python -m py_compile server.py test_*.py
+
+      - name: Run unit and contract tests
+        run: python -m unittest discover -v
+
+      - name: Download official SNIRF smoke fixture
+        run: |
+          mkdir -p ci-data
+          curl --fail --location --retry 4 --retry-delay 3 --max-time 180 \
+            -o ci-data/mne_nirsport2_raw.snirf \
+            https://doc.ibs.tu-berlin.de/cedalion/datasets/26.5.1/mne_nirsport2_raw.snirf
+          test "$(sha256sum ci-data/mne_nirsport2_raw.snirf | cut -d' ' -f1)" = \
+            12e5fabe64ecc7ef4b83f6bcd77abb41f5480d5f17a2b1aae0e2ad0406670944
+
+      - name: Run checksum-verified official SNIRF smoke test
+        env:
+          FNIRS_CI_OFFICIAL_SNIRF: "1"
+          FNIRS_CI_OFFICIAL_SNIRF_PATH: ci-data/mne_nirsport2_raw.snirf
+        run: python -m unittest -v test_official_snirf

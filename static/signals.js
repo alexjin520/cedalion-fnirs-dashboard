@@ -41,9 +41,13 @@
     const previous = select.value;
     const concentration = state.currentKind === "conc" || state.currentKind === "conc_filtered";
     const options = series.components.map((item) => optionElement(item.value, item.label));
-    if (concentration && series.components.length > 1) {
-      select.replaceChildren(optionElement("both", "HbO + HbR"), ...options);
-      select.value = previous === "HbO" || previous === "HbR" ? previous : "both";
+    if (series.components.length > 1) {
+      const combinedLabel = concentration
+        ? "HbO + HbR"
+        : `全部波长（${series.components.map((item) => item.label).join(" + ")}）`;
+      select.replaceChildren(optionElement("both", combinedLabel), ...options);
+      const singleValues = new Set(series.components.map((item) => item.value));
+      select.value = singleValues.has(previous) ? previous : "both";
     } else {
       select.replaceChildren(...options);
       if (series.components.some((item) => item.value === previous)) select.value = previous;
@@ -59,6 +63,9 @@
     if (!channel) return;
     $("source-name").textContent = channel.source;
     $("detector-name").textContent = channel.detector;
+    $("channel-distance").textContent = channel.distance_mm == null
+      ? "—"
+      : `${formatValue(channel.distance_mm, 3)} mm`;
     $("channel-snr").textContent = `${formatValue(channel.snr, 3)} / ${formatValue(channel.snr_minimum, 3)}`;
     $("channel-sci").textContent = formatValue(channel.sci, 3);
     $("channel-psp").textContent = formatValue(channel.psp, 4);
@@ -81,6 +88,19 @@
     const kind = signal?.series?.kind;
     if (component === "HbO") return ["#ff765f", "#ffb071"];
     if (component === "HbR") return ["#59a8ff", "#73e0ef"];
+    if (component?.endsWith("nm")) {
+      const numericWavelength = Number.parseFloat(component);
+      const series = state.recording?.series_options.find((item) => item.kind === kind);
+      const wavelengthIndex = series?.components.findIndex(
+        (item) => Number(item.value) === numericWavelength,
+      ) ?? 0;
+      const wavelengthColors = [
+        ["#2dd4bf", "#8ee6bf"],
+        ["#4da3ff", "#9acbff"],
+        ["#f5b942", "#ffd889"],
+      ];
+      return wavelengthColors[Math.max(0, wavelengthIndex) % wavelengthColors.length];
+    }
     if (kind === "od") return ["#f3c770", "#ff9d66"];
     return ["#5fe0b0", "#67a9ff"];
   }
@@ -108,7 +128,7 @@
       const componentLabel = signals.map((item) => item.series.component).join(" + ");
       $("chart-title").textContent = `${first.series.label} · ${componentLabel}`;
       $("chart-subtitle").textContent = `${first.series.channel.label}（${first.series.channel.source}–${first.series.channel.detector}）· 单位 ${unit}`;
-      $("stats-component").textContent = `${first.series.component} · ${unit}`;
+      $("stats-component").textContent = `${first.series.component} 统计 · ${unit}`;
       $("stat-min").textContent = `${formatValue(first.stats.minimum)} ${unit}`;
       $("stat-max").textContent = `${formatValue(first.stats.maximum)} ${unit}`;
       $("stat-mean").textContent = `${formatValue(first.stats.mean)} ${unit}`;

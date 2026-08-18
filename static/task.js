@@ -3,6 +3,41 @@
   initShell("task");
   const state = { recording: null, quality: [], response: null, glm: null };
 
+  function normalizeInferenceState(readiness, available) {
+    const stateValue = readiness?.state;
+    if (["pending", "unavailable", "exploratory", "ready"].includes(stateValue)) return stateValue;
+    if (!available) return "unavailable";
+    return readiness?.ready === true ? "ready" : "exploratory";
+  }
+
+  function renderInferenceReadiness(readiness, available) {
+    const status = normalizeInferenceState(readiness || {}, available);
+    const badge = $("glm-readiness-badge");
+    const note = $("glm-inference-note");
+    if (!badge || !note) return;
+    const minimum = Number(readiness?.minimum_trials_per_condition) || 2;
+    const insufficient = Array.isArray(readiness?.insufficient_conditions) ? readiness.insufficient_conditions.filter(Boolean) : [];
+    const fallbackReason = status === "ready"
+      ? `每个条件至少有 ${minimum} 个可用重复试次。`
+      : status === "exploratory"
+        ? `GLM 数值可以计算，但重复试次不足 ${minimum} 个；当前结果仅供探索，不应作为确认性推断。`
+        : status === "pending"
+          ? "GLM 尚未计算，首次打开任务统计时会按需执行。"
+        : "当前记录没有可用于 GLM 的结果。";
+    const baseReason = readiness?.reason || fallbackReason;
+    const reason = status === "exploratory" && insufficient.length
+      ? `${baseReason.replace(/[。；]+$/, "")}；重复试次不足的条件：${insufficient.join("、")}。`
+      : baseReason;
+    const labels = { ready: "推断就绪", exploratory: "仅探索性 GLM", pending: "GLM 待计算", unavailable: "GLM 不可用" };
+    const classes = { ready: "badge-good", exploratory: "badge-warning", pending: "badge-neutral", unavailable: "badge-bad" };
+    badge.className = `badge ${classes[status]}`;
+    badge.textContent = labels[status];
+    note.replaceChildren();
+    const strong = document.createElement("strong");
+    strong.textContent = labels[status];
+    note.append(strong, document.createTextNode(`：${reason}`));
+  }
+
   function taskChannels() {
     return state.quality.filter((channel) => channel.task_channel_eligible);
   }
@@ -31,7 +66,17 @@
   function setupGlmControls() {
     const glm = state.recording.task.glm || {};
     const contrast = $("glm-contrast");
+    const pending = glm.status === "pending" || glm.pending === true || state.recording.task.inference_readiness?.pending === true;
     if (!glm.available) {
+      renderInferenceReadiness(glm.inference_readiness || state.recording.task.inference_readiness, false);
+      if (pending) {
+        contrast.replaceChildren(optionElement("", "GLM 待计算"));
+        contrast.disabled = true;
+        $("glm-export").disabled = true;
+        $("glm-method").textContent = "首次请求 GLM 统计时按需拟合";
+        $("glm-message").textContent = "GLM 尚未计算；任务平均可以先行查看。";
+        return false;
+      }
       contrast.replaceChildren(optionElement("", "GLM 不可用"));
       contrast.disabled = true;
       $("glm-export").disabled = true;
@@ -39,6 +84,7 @@
       $("glm-message").textContent = glm.error || "GLM 统计不可用；描述性任务平均仍可正常查看。";
       return false;
     }
+    renderInferenceReadiness(glm.inference_readiness || state.recording.task.inference_readiness, true);
     const previous = contrast.value;
     contrast.replaceChildren(...glm.contrasts.map((item) => optionElement(item.value, item.label)));
     if (glm.contrasts.some((item) => item.value === previous)) contrast.value = previous;
@@ -110,12 +156,21 @@
   }
 
   async function loadGlm() {
-    if (!state.recording?.task?.glm?.available || $("task-channel").disabled) return;
-    const query = new URLSearchParams({ condition: $("task-condition").value, channel: $("task-channel").value });
+    if (!state.recording?.task?.available || $("task-channel").disabled) return;
+    const pending = state.recording.task.glm?.status === "pending" || state.recording.task.inference_readiness?.pending === true;
+    const query = new URLSearchParams({ condition: $("task-condition").value });
+    query.set("channel", pending ? "auto" : $("task-channel").value);
     if (!$("glm-contrast").disabled) query.set("contrast", $("glm-contrast").value);
     try {
       const payload = await getJSON(`/api/task-glm?${query}`);
       state.glm = payload;
+      state.recording.task.glm = payload.summary;
+      state.recording.task.inference_readiness = payload.inference_readiness || payload.summary?.inference_readiness || state.recording.task.inference_readiness;
+      setupGlmControls();
+      const previousChannel = String($("task-channel").value);
+      if (payload.channel?.index !== undefined) $("task-channel").value = String(payload.channel.index);
+      if (previousChannel !== String($("task-channel").value)) await loadResponse();
+      renderInferenceReadiness(payload.inference_readiness || payload.summary?.inference_readiness || state.recording.task.glm?.inference_readiness || state.recording.task.inference_readiness, true);
       $("glm-subtitle").textContent = `${payload.channel.label}（${payload.channel.source}–${payload.channel.detector}）· ${payload.condition.label} 的 Gamma HRF 系数`;
       $("glm-condition-title").textContent = `${payload.condition.label} 条件效应`;
       renderGlmRows("glm-condition-body", payload.condition_effects, "beta", "没有该条件的 GLM 统计量");
@@ -177,7 +232,7 @@
 
   function taskQuery() { return new URLSearchParams({ condition: $("task-condition").value, channel: $("task-channel").value }); }
   function exportCSV() { if (state.response) { const link = document.createElement("a"); link.href = withRecording(`/api/task-export?${taskQuery()}`); link.click(); } }
-  function exportGlmCSV() { if (state.recording?.task?.glm?.available) { const link = document.createElement("a"); link.href = withRecording("/api/task-glm-export"); link.click(); } }
+  function exportGlmCSV() { if (state.recording?.task?.available) { const link = document.createElement("a"); link.href = withRecording("/api/task-glm-export"); link.click(); } }
   function exportPNG() {
     if (!state.response) return;
     $("task-chart").toBlob((blob) => {
