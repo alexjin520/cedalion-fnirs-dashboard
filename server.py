@@ -5648,6 +5648,8 @@ class DashboardHandler(SimpleHTTPRequestHandler):
                 "/task/": "/task.html",
                 "/quality": "/quality.html",
                 "/quality/": "/quality.html",
+                "/probe": "/probe.html",
+                "/probe/": "/probe.html",
             }
             if parsed.path in page_routes:
                 self.path = page_routes[parsed.path]

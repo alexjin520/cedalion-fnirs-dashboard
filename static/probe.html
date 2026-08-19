@@ -1,0 +1,17 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head><meta charset="utf-8" /><meta name="viewport" content="width=device-width, initial-scale=1" /><meta name="theme-color" content="#f5f6f4" /><title>探头拓扑 · Cedalion fNIRS</title><link rel="icon" href="/favicon.svg" type="image/svg+xml" /><link rel="stylesheet" href="/workspace.css?v=topology-2" /></head>
+  <body data-page="probe">
+    <header class="appbar"><div class="appbar-inner">
+      <a class="brand" href="/" aria-label="fNIRS 分析工作台首页"><span class="brand-mark" aria-hidden="true"><svg viewBox="0 0 32 32"><path d="M6 20c3-8 5 7 8-4s5 7 8-4 3 0 4 0" /></svg></span><span><strong>fNIRS</strong><small>Analysis Workspace</small></span></a>
+      <nav class="primary-nav" aria-label="主导航"><a href="/" data-nav-page="overview">总览</a><a href="/signals.html" data-nav-page="signals">信号浏览</a><a href="/task.html" data-nav-page="task">任务响应</a><a href="/quality.html" data-nav-page="quality">质量与记录</a><a href="/probe.html" data-nav-page="probe">探头拓扑</a></nav>
+      <div class="appbar-actions"><div id="connection" class="connection waiting" role="status" aria-live="polite"><span class="status-dot"></span><span>正在连接</span></div><button id="refresh" class="button button-primary" type="button"><svg viewBox="0 0 24 24"><path d="M20 11a8 8 0 1 0-2.3 5.7M20 4v7h-7" /></svg>刷新</button></div>
+    </div></header>
+    <main class="shell page-shell">
+      <header class="page-heading"><div><p class="eyebrow">PROBE GEOMETRY</p><h1>探头拓扑</h1><p>查看光源、探测器和测量通道的空间关系；通道颜色叠加当前质量判定。</p></div><div class="page-context"><strong id="context-file">正在读取记录…</strong><span id="context-meta">—</span></div></header>
+      <section class="panel topology-panel topology-page-panel" aria-labelledby="topology-title"><div class="topology-heading"><div><p class="eyebrow">XY PROJECTION</p><h2 id="topology-title">探头布局与通道连接</h2></div><p id="topology-summary">正在读取坐标…</p></div><div class="topology-legend"><span><i class="topology-dot source"></i>光源</span><span><i class="topology-dot detector"></i>探测器</span><span><i class="topology-line good"></i>通过通道</span><span><i class="topology-line bad"></i>需关注</span></div><div id="topology-plot" class="topology-plot"><p class="empty-state">等待探头坐标</p></div><p id="topology-note" class="quality-note">悬停通道查看距离和质量状态，点击通道进入信号浏览。</p></section>
+      <footer class="page-footer"><span>坐标单位为 mm；图中显示 SNIRF 提供的 XY 投影。</span><span id="updated-at">尚未更新</span></footer>
+    </main>
+    <script src="/common.js?v=psp-1" defer></script><script src="/probe.js?v=topology-2" defer></script>
+  </body>
+</html>

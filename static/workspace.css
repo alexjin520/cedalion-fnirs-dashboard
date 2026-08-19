@@ -581,7 +581,7 @@ tbody tr.selected { background: var(--accent-soft); }
 @media (max-width: 560px) {
   .appbar-inner { gap: 6px 10px; }
   .appbar-actions .connection { display: none; }
-  .primary-nav { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); margin-right: 0; overflow: visible; }
+  .primary-nav { display: grid; grid-template-columns: repeat(5, minmax(0, 1fr)); margin-right: 0; overflow: visible; }
   .primary-nav a { min-height: 35px; justify-content: center; padding: 0 5px; font-size: 10px; }
   .primary-nav a.active::after { right: 9px; left: 9px; }
   .page-heading { padding-bottom: 18px; }
