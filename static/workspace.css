@@ -338,6 +338,10 @@ select:disabled { cursor: not-allowed; color: var(--muted); }
 .topology-heading { display: flex; align-items: start; justify-content: space-between; gap: 18px; }
 .topology-heading h3 { margin: 0; font-size: 16px; }
 .topology-heading > p { margin: 4px 0 0; color: var(--muted); font-size: 11px; text-align: right; }
+.topology-toolbar { display: flex; align-items: end; flex-wrap: wrap; gap: 9px; margin: 14px 0 10px; }
+.topology-toolbar label { display: grid; min-width: 190px; gap: 5px; color: var(--muted); font-size: 10px; }
+.topology-toolbar select { min-height: 34px; padding: 0 9px; border: 1px solid var(--border); }
+.topology-toolbar .button { min-height: 34px; }
 .topology-legend { display: flex; flex-wrap: wrap; gap: 12px; margin: 11px 0 4px; color: var(--text-secondary); font-size: 10px; }
 .topology-legend span { display: inline-flex; align-items: center; gap: 5px; }
 .topology-dot { width: 9px; height: 9px; border-radius: 50%; background: var(--blue); }
@@ -345,10 +349,12 @@ select:disabled { cursor: not-allowed; color: var(--muted); }
 .topology-line { width: 18px; height: 2px; background: var(--success); }.topology-line.bad { background: var(--danger); }
 .topology-plot { min-height: 260px; overflow: hidden; border: 1px solid var(--border-soft); border-radius: 6px; background: var(--chart-bg); }
 .topology-plot svg { width: 100%; height: auto; min-height: 260px; }
-.topology-channel { stroke-width: 1.4; opacity: .55; cursor: pointer; outline: none; }
+.topology-channel { stroke-width: 1.4; opacity: .34; cursor: pointer; outline: none; transition: opacity .14s ease, stroke-width .14s ease; }
 .topology-channel.good { stroke: var(--success); }.topology-channel.bad { stroke: var(--danger); }
-.topology-channel:hover, .topology-channel:focus { stroke-width: 3; opacity: 1; }
+.topology-channel.is-hidden { display: none; }.topology-channel.is-muted { opacity: .08; }.topology-channel.is-focus, .topology-channel:hover, .topology-channel:focus { stroke-width: 3; opacity: 1; }
 .topology-node { stroke: var(--chart-bg); stroke-width: 2; }.topology-node.source { fill: var(--hbo); }.topology-node.detector { fill: var(--hbr); }.topology-node.optode { fill: var(--warning); }
+.topology-node { cursor: pointer; outline: none; transition: r .14s ease, opacity .14s ease; }
+.topology-node.is-adjacent { stroke: var(--accent); stroke-width: 3; }.topology-node.is-focus { stroke: var(--text); stroke-width: 3; }
 .search-field { position: relative; width: min(330px, 42%); }
 .search-field svg { position: absolute; top: 10px; left: 11px; width: 16px; height: 16px; color: var(--muted); }
 .search-field input { padding: 0 12px 0 36px; color: var(--text); }
