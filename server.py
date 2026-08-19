@@ -1666,6 +1666,18 @@ def _validate_geometry(
         errors.append("探头几何缺少通道所需光极：" + ", ".join(missing_labels[:8]))
 
     _raise_validation_errors(errors)
+    optode_details = []
+    if positions is not None:
+        for label, position in zip(label_values, positions):
+            optode_details.append(
+                {
+                    "label": label,
+                    "kind": "source" if label.upper().startswith("S") else "detector" if label.upper().startswith("D") else "optode",
+                    "x_mm": _finite_number(position[0]),
+                    "y_mm": _finite_number(position[1]),
+                    "z_mm": _finite_number(position[2]),
+                }
+            )
     try:
         distances = channel_distances(amplitudes, geo3d).pint.to("millimeter")
         distance_values = _values(distances)
@@ -1691,6 +1703,7 @@ def _validate_geometry(
         "warnings": warnings,
         "unit": geometry_unit,
         "optodes": len(labels),
+        "optode_positions_mm": optode_details,
         "sources": len(source_labels),
         "detectors": len(detector_labels),
         "validated_channels": int(distance_values.size),
@@ -5711,6 +5724,9 @@ class DashboardHandler(SimpleHTTPRequestHandler):
                 body, filename = analysis_metadata_bytes(analysis)
                 return self._bytes(body, "application/json; charset=utf-8", filename)
             if parsed.path == "/api/probe":
+                quality_by_label = {
+                    item["label"]: item for item in analysis.quality
+                }
                 return self._json(
                     {
                         "ok": True,
@@ -5718,6 +5734,17 @@ class DashboardHandler(SimpleHTTPRequestHandler):
                         "analysis_id": analysis.summary["analysis"]["id"],
                         "filename": analysis.summary["filename"],
                         "geometry": analysis.summary["input_validation"]["geometry"],
+                        "channels": [
+                            {
+                                "index": item["index"],
+                                "label": item["label"],
+                                "source": item["source"],
+                                "detector": item["detector"],
+                                "distance_mm": item.get("distance_mm"),
+                                "passed": quality_by_label.get(item["label"], {}).get("passed", False),
+                            }
+                            for item in analysis.channels
+                        ],
                         "short_separation": analysis.summary["short_separation"],
                     }
                 )

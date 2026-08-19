@@ -106,6 +106,15 @@ class RealRecordingApiContractTests(unittest.TestCase):
         self.assertEqual(manifest["manifest_version"], "1.4")
         self.assertEqual(manifest["preprocessing"]["resampling"], summary["resampling"])
 
+    def test_probe_contract_includes_positions_and_channel_links(self) -> None:
+        probe = self.get_json("/api/probe")
+        positions = probe["geometry"]["optode_positions_mm"]
+        self.assertGreater(len(positions), 0)
+        self.assertTrue(all({"label", "kind", "x_mm", "y_mm", "z_mm"} <= set(item) for item in positions))
+        channels = probe["channels"]
+        self.assertGreater(len(channels), 0)
+        self.assertTrue(all({"source", "detector", "passed"} <= set(item) for item in channels))
+
     def test_csv_exports_keep_analysis_and_readiness_contract(self) -> None:
         quality = self.get_json("/api/quality")
         self.assertIn("distance_mm", quality["channels"][0])
